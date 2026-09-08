@@ -14,25 +14,6 @@ This project provides a framework for systematic stock selection and signal gene
 
 All data handling, signal logging, and evaluation are modularized, making it easy to extend or replace components.
 
----
-
-## Project Structure
-quant_program/
-    - main.py
-    - data/
-        - query_data.py          
-        - save_update_data.py 
-    - strategy/
-        - fund_screen.py 
-        - tech_signal.py
-    - evaluation/
-        - eval_perform.py
-    - utils/
-        - text_utils.py
-        - plot_utils.py
-        - calc_utils.py       
-    - config/
-        - settings.yaml
 
 
 
