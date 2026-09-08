@@ -1,20 +1,38 @@
-# The struture of the program
+# Quantitative Investment Program
+
+A modular quantitative trading system that screens stocks based on fundamental data, generates trading signals using technical indicators, and evaluates strategy performance. The program is designed for research and backtesting purposes.
+
+---
+
+## Overview
+
+This project provides a framework for systematic stock selection and signal generation:
+
+- **Fundamental Screening** – Filters a universe of stocks based on fundamental data using large language models.
+- **Technical Signal Generation** – Computes indicators to produce buy/hold/sell signals for the filtered stocks.
+- **Performance Evaluation** – Calculates gains/losses based on the generated signals and produces a summary report.
+
+All data handling, signal logging, and evaluation are modularized, making it easy to extend or replace components.
+
+---
+
+## Project Structure
 quant_program/
-├── main.py
-├── data/
-│   ├── query_data.py          
-│   └── save_update_data.py    
-├── strategy/
-│   ├── fund_screen.py         # load fundamental data and screen stocks -> a list of screened stocks
-│   └── tech_signal.py         # load technical/market data, calculate factors, generate signals(buy, sell, hold) -> log files of trading signals for the screened stocks
-├── evaluation/
-│   └── eval_perform.py        # load the log files, calculate gain / loss -> the performace report
-├── utils/
-│   ├── logger.py              
-│   └── config_loader.py       
-└── tests/
-    ├── test_fund_screen.py
-    └── test_tech_signal.py
+    - main.py
+    - data/
+        - query_data.py          
+        - save_update_data.py 
+    - strategy/
+        - fund_screen.py 
+        - tech_signal.py
+    - evaluation/
+        - eval_perform.py
+    - utils/
+        - text_utils.py
+        - plot_utils.py
+        - calc_utils.py       
+    - config/
+        - settings.yaml
 
 
 
