@@ -20,20 +20,32 @@ with open(config_path, 'r', encoding='utf-8') as file:
 time_window = config['TIME_WINDOW']
 price_level_threshold = config['PRICE_LEVEL_THRESHOLD']
 price_trend_threshold = config['PRICE_TREND_THRESHOLD']
-trading_amount_threshold = config['TRADING_AMOUNT_THRESHOLD']
+trading_amount_window = config['TRADING_AMOUNT_WINDOW']
 price_trend_window = config['PRICE_TREND_WINDOW']
+trading_range_threshold = config['TRADING_RANGE_THRESHOLD']
 
 
-def linear_reg_for_price_trend(high_series: pd.Series, low_series: pd.Series) -> float:
-    x1 = np.arange(len(high_series))
-    x2 = np.arange(len(low_series))
-    k1 = np.polyfit(x1, high_series, 1)[0]
-    k2 = np.polyfit(x2, low_series, 1)[0]
-    return k1, k2
+
+def log_linear_reg(price_series: pd.Series) -> float:
+    x = np.arange(len(price_series))
+    k = np.polyfit(x, np.log(price_series), 1)[0]
+    return k
+
+def tech_analysis_router(close_series: pd.Series) -> str:
+    if (close_series.iloc[int(-1*time_window/2):].max() - close_series.iloc[int(-1*time_window/2):].min()) / close_series.iloc[int(-1*time_window/2):].mean() < trading_range_threshold:
+        return 'narrow range oscillation'
+    elif close_series.iloc[-1] > close_series.iloc[:-1].max():
+        return 'above the previous high'
+    elif close_series.iloc[-1] < close_series.iloc[:-1].min():
+        return 'below the prevvious low'
+    else:
+        return 'nothing special'
+
 
 def diff_price_trend(high_series: pd.Series, low_series: pd.Series) -> str:
-    k1, k2 = linear_reg_for_price_trend(high_series[-price_trend_window:], low_series[-price_trend_window:])
-    logger.info(f'price trend slope for high {k1: .1f} and low {k2: .1f}')
+    k1 = log_linear_reg(high_series[-price_trend_window:])
+    k2 = log_linear_reg(low_series[-price_trend_window:])
+    logger.info(f'price trend slope for high {k1: .4f} and low {k2: .4f}')
     if k1 > price_trend_threshold and k2 > price_trend_threshold:
         return 'up'
     elif abs(k1) < price_trend_threshold and k2 > price_trend_threshold:
@@ -58,51 +70,95 @@ def diff_price_level(close_series: pd.Series, high_series: pd.Series, low_series
         return 'mid'
 
 def diff_trading_amount(amount_series: pd.Series) -> str:
-    logger.info(f'trading amount average: {amount_series.mean(): .1f}, trading amount: {amount_series.iloc[-1]: .1f}')
-    if amount_series.iloc[-1] > (1 + trading_amount_threshold) * amount_series.mean():
+    logger.info(f'trading amount average: {amount_series.iloc[-trading_amount_window:].mean(): .1f}, trading amount: {amount_series.iloc[-1]: .1f}')
+    if amount_series.iloc[-1] > 1.5 * amount_series.iloc[-trading_amount_window:].mean():
         return 'high'
-    elif amount_series.iloc[-1] < (1 - trading_amount_threshold) * amount_series.mean():
+    elif amount_series.iloc[-1] < 0.5 * amount_series.iloc[-trading_amount_window:].mean():
         return 'low'
     else:
         return 'mid'
 
 
-handlers = {
-    ('up', 'high', 'high'): 'sell',
-    ('up', 'high', 'mid'): 'sell',
-    ('up', 'high', 'low'): 'sell+',
-    ('up', 'mid', 'high'): 'buy',
+nothing_special_handlers = {
+# (price_trend, price_level, trading_amount)
+    ('up', 'high', 'high'): 'hold',
+    ('up', 'high', 'mid'): 'hold',
+    ('up', 'high', 'low'): 'hold',
+    ('up', 'mid', 'high'): 'hold',
     ('up', 'mid', 'mid'): 'hold',
     ('up', 'mid', 'low'): 'hold',
     ('up', 'low', 'high'): 'buy+',
     ('up', 'low', 'mid'): 'buy',
     ('up', 'low', 'low'): 'hold',
-    ('sideways', 'high', 'high'): 'sell',
-    ('sideways', 'high', 'mid'): 'sell',
-    ('sideways', 'high', 'low'): 'sell+',
+    ('sideways', 'high', 'high'): 'hold',
+    ('sideways', 'high', 'mid'): 'hold',
+    ('sideways', 'high', 'low'): 'hold',
     ('sideways', 'mid', 'high'): 'hold',
     ('sideways', 'mid', 'mid'): 'hold',
     ('sideways', 'mid', 'low'): 'hold',
     ('sideways', 'low', 'high'): 'buy',
     ('sideways', 'low', 'mid'): 'hold',
     ('sideways', 'low', 'low'): 'hold',
-    ('down', 'high', 'high'): 'sell+',
-    ('down', 'high', 'mid'): 'sell+',
-    ('down', 'high', 'low'): 'sell+',
+    ('down', 'high', 'high'): 'sell',
+    ('down', 'high', 'mid'): 'sell',
+    ('down', 'high', 'low'): 'sell',
     ('down', 'mid', 'high'): 'sell',
     ('down', 'mid', 'mid'): 'sell',
     ('down', 'mid', 'low'): 'hold',
     ('down', 'low', 'high'): 'hold',
     ('down', 'low', 'mid'): 'hold',
-    ('down', 'low', 'low'): 'hold'
+    ('down', 'low', 'low'): 'buy'
 }
 
 
+above_high_handlers = {
+# (price_trend, trading_amount)
+('up', 'high') : 'buy',
+('up', 'mid') : 'buy',
+('up', 'low') : 'hold',
+('sideways', 'high') : 'sell',
+('sideways', 'mid') : 'sell',
+('sideways', 'low') : 'hold',
+('down', 'high') : 'sell+',
+('down', 'mid') : 'sell',
+('down', 'low') : 'hold'
+}
+
+
+below_low_handlers = {
+#  (price_trend, trading_amount)
+('up', 'high') : 'sell',
+('up', 'mid') : 'sell',
+('up', 'low') : 'sell',
+('sideways', 'high') : 'sell+',
+('sideways', 'mid') : 'sell+',
+('sideways', 'low') : 'sell+',
+('down', 'high') : 'sell++',
+('down', 'mid') : 'sell++',
+('down', 'low') : 'sell++'
+}
+
+
+narrow_range_handlers = {
+# (price_level, trading_amount)
+('high', 'high') : 'sell+',
+('high', 'mid') : 'sell',
+('high', 'low') : 'sell',
+('mid', 'high') : 'sell',
+('mid', 'mid') : 'hold',
+('mid', 'low') : 'hold',
+('low', 'high') : 'hold',
+('low', 'mid') : 'hold',
+('low', 'low') : 'hold'
+}
+
 signal_handlers =  {
-    'sell' : -5,
-    'sell+' : -10,
+    'sell' : -1,
+    'sell+' : -2,
+    'sell++' : -3,
     'buy' : 1,
-    'buy+' : 3,
+    'buy+' : 2,
+    'buy++' : 3,
     'hold' : 0
 }
 
@@ -131,11 +187,26 @@ def change_position_by_tech_analysis(date_series: pd.Series, close_series: pd.Se
         price_level = diff_price_level(close, high, low)
         price_trend = diff_price_trend(high, low)
         trading_amount = diff_trading_amount(amount)
-        situation = (price_trend, price_level, trading_amount)
-        signal = handlers.get(situation, 'hold')
-        logger.info(f'Date: {date} | Technical analysis situation and signal: {situation} {signal}')
+        if tech_analysis_router(close) == 'narrow range oscillation':
+            router = 'narrow range oscillation'
+            situation = (price_level, trading_amount)
+            signal = narrow_range_handlers.get(situation, 'hold')
+        elif tech_analysis_router(close) == 'above the previous high':
+            router = 'above the previous high'
+            situation = (price_trend, trading_amount)
+            signal = above_high_handlers.get(situation, 'hold')
+        elif tech_analysis_router(close) == 'below the previous low':
+            router = 'below the previous low'
+            situation = (price_trend, trading_amount)
+            signal = below_low_handlers.get(situation, 'hold')
+        elif tech_analysis_router(close) == 'nothing special':
+            router = 'nothing special'
+            situation = (price_trend, price_level, trading_amount)
+            signal = nothing_special_handlers.get(situation, 'hold')
+
+        logger.info(f'Date: {date} | Technical analysis: {router} | {situation} | {signal}')
         position_series.iloc[i] = max(0, min((position_series.iloc[i-1] + signal_handlers.get(signal, 0)), 10))
-        logger.info(f'Date: {date} | old position: {position_series.iloc[i-1]} | new position: {position_series.iloc[i]}')
+        logger.info(f'Date: {date} | old position: {position_series.iloc[i-1]} / 10 | new position: {position_series.iloc[i]} / 10')
         logger.info(f'========')
 
 

@@ -43,7 +43,7 @@ def check_date_out_bound(date_bound: str, date: str) -> bool:
 
 def read_from_csv(filename:str) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     df = pd.read_csv(filename, dtype=str)
-    df_cleaned = df.dropna() # remove the days with no trading
+    df_cleaned = df.dropna().reset_index(drop=True) # remove the days with no trading
     date_series = df_cleaned['date']
     open_series = df_cleaned['open'].astype(float)
     close_series = df_cleaned['close'].astype(float)

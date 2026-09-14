@@ -2,8 +2,6 @@
 
 A modular quantitative trading system that screens stocks based on fundamental data, generates trading signals using technical indicators, and evaluates strategy performance. The program is designed for research and backtesting purposes.
 
----
-
 ## Overview
 
 This project provides a framework for systematic stock selection and signal generation:
