@@ -41,16 +41,19 @@ def check_date_out_bound(date_bound: str, date: str) -> bool:
 
 
 
-def read_from_csv(filename:str) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+def read_from_csv(filename:str) -> pd.DataFrame:
     df = pd.read_csv(filename, dtype=str)
     df_cleaned = df.dropna().reset_index(drop=True) # remove the days with no trading
-    date_series = df_cleaned['date']
-    open_series = df_cleaned['open'].astype(float)
-    close_series = df_cleaned['close'].astype(float)
-    high_series = df_cleaned['high'].astype(float)
-    low_series = df_cleaned['low'].astype(float)
-    amount_series = df_cleaned['amount'].astype(float)
-    return date_series, open_series, close_series, high_series, low_series, amount_series
+    data = pd.DataFrame()
+    data['date'] = df_cleaned['date']
+    data['open'] = df_cleaned['open'].astype(float)
+    data['close'] = df_cleaned['close'].astype(float)
+    data['high'] = df_cleaned['high'].astype(float)
+    data['low'] = df_cleaned['low'].astype(float)
+    data['volume'] = df_cleaned['volume'].astype(float)
+    data['amount'] = df_cleaned['amount'].astype(float)
+    return data
+
 
 
 

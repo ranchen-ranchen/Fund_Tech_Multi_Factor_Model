@@ -1,9 +1,4 @@
 
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import calendar
-import time
 import os
 from openai import OpenAI
 from dotenv import load_dotenv

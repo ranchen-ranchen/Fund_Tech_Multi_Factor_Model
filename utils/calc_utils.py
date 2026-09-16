@@ -10,15 +10,11 @@ import time
 
 
 
-def linear_reg_for_price_trend(high_series: pd.Series, low_series: pd.Series) -> float:
-    x1 = np.arange(len(high_series))
-    x2 = np.arange(len(low_series))
-    k1 = np.polyfit(x1, high_series, 1)[0]
-    k2 = np.polyfit(x2, low_series, 1)[0]
-    return k1, k2
 
-
-
+def log_linear_reg(price_series: pd.Series) -> float:
+    x = np.arange(len(price_series))
+    k = np.polyfit(x, np.log(price_series), 1)[0]
+    return k
 
 
 
