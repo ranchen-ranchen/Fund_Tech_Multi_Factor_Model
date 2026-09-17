@@ -94,11 +94,20 @@ def rolling_slope(series, window):
 # ============================================================
 # 3. 大趋势 / 小趋势 打分
 # ============================================================
-def compute_trend(df):
+def compute_trend(df, adx_threshold=20, adx_mode="shrink",
+                  pivot_window=5, sr_lookback=120, sr_tolerance=0.015):
     df = df.copy()
     df = add_ma(df)
     df = add_macd(df)
     df = add_adx(df)
+
+     # 支撑 / 阻力
+    df = add_support_resistance(df,
+                                pivot_window=pivot_window,
+                                lookback=sr_lookback,
+                                tolerance=sr_tolerance)
+
+
 
     # 均线斜率，转成"日均涨跌百分比"，便于跨股票比较
     df["SLOPE_MA120"] = rolling_slope(df["MA120"], 20) / df["MA120"] * 100
@@ -133,6 +142,153 @@ def compute_trend(df):
     small["MA20向上"] = np.where(df["SLOPE_MA20"] > 0, 1, -1)
     df["SMALL_SCORE"] = small.sum(axis=1)      # 取值 -4 ~ +4
 
+    # ---------- ADX 门槛 ----------
+    df = apply_adx_gate(df, adx_threshold=adx_threshold, mode=adx_mode)
+
+    return df
+
+
+# ============================================================
+# 3.4 支撑 / 阻力位（无前视）
+# ============================================================
+def _cluster_levels(levels, tolerance):
+    """把相近的价位聚成一个簇，返回簇均值列表"""
+    if not levels:
+        return []
+    s = sorted(levels)
+    clusters, cur = [], [s[0]]
+    for v in s[1:]:
+        if (v - cur[-1]) / cur[-1] <= tolerance:
+            cur.append(v)
+        else:
+            clusters.append(sum(cur) / len(cur))
+            cur = [v]
+    clusters.append(sum(cur) / len(cur))
+    return clusters
+
+
+def add_support_resistance(df, pivot_window=5, lookback=120,
+                           max_levels=3, tolerance=0.015):
+    """
+    计算每日的支撑 / 阻力位。
+
+    无前视设计：
+      · 枢轴高点/低点：center=True 窗口识别后 shift(pivot_window) 对齐，
+        保证 t 时刻只使用已经在 t 收盘时被确认的枢轴。
+      · 前高/前低：shift(1) 排除当日，再 rolling(lookback)。
+      · 聚类、排序全部只依赖 t 及之前的数据。
+
+    新增列：
+      SUPPORT_1..3    / RESISTANCE_1..3     由近到远（SUPPORT_1 = 最近支撑）
+      DIST_SUPPORT    / DIST_RESISTANCE     相对现价的百分比距离
+    """
+    df = df.copy()
+    high, low, close = df["high"], df["low"], df["close"]
+
+    # ---- 1. 历史枢轴点（已对齐，无前视） ----
+    win = 2 * pivot_window + 1
+    roll_hi_c = high.rolling(win, center=True).max()
+    roll_lo_c = low.rolling(win, center=True).min()
+    # 位置 p 的枢轴 → 位置 p+pivot_window 才能看到
+    pivot_high = high.where(high == roll_hi_c).shift(pivot_window)
+    pivot_low  = low.where(low == roll_lo_c).shift(pivot_window)
+
+    # ---- 2. 滚动前高 / 前低（不含当日） ----
+    roll_hi = high.shift(1).rolling(lookback, min_periods=1).max()
+    roll_lo = low.shift(1).rolling(lookback, min_periods=1).min()
+
+    n = len(df)
+    sup_arr = np.full((n, max_levels), np.nan)
+    res_arr = np.full((n, max_levels), np.nan)
+
+    ph_np, pl_np = pivot_high.to_numpy(), pivot_low.to_numpy()
+    rh_np, rl_np = roll_hi.to_numpy(),   roll_lo.to_numpy()
+    cl_np = close.to_numpy()
+
+    for i in range(n):
+        # 只保留 lookback 以内的枢轴，控制计算复杂度
+        start = max(0, i - lookback)
+        levels = []
+        for j in range(start, i + 1):
+            if not np.isnan(ph_np[j]):
+                levels.append(ph_np[j])
+            if not np.isnan(pl_np[j]):
+                levels.append(pl_np[j])
+        if not np.isnan(rh_np[i]):
+            levels.append(rh_np[i])
+        if not np.isnan(rl_np[i]):
+            levels.append(rl_np[i])
+        if not levels:
+            continue
+
+        price = cl_np[i]
+        clusters = _cluster_levels(levels, tolerance)
+
+        # 现价下方的支撑（取最近的 max_levels 个）
+        sups = sorted([c for c in clusters if c < price], reverse=True)[:max_levels]
+        # 现价上方的阻力
+        ress = sorted([c for c in clusters if c > price])[:max_levels]
+
+        for k, v in enumerate(sups):
+            sup_arr[i, k] = v
+        for k, v in enumerate(ress):
+            res_arr[i, k] = v
+
+    for k in range(max_levels):
+        df[f"SUPPORT_{k+1}"]    = sup_arr[:, k]
+        df[f"RESISTANCE_{k+1}"] = res_arr[:, k]
+
+    df["DIST_SUPPORT"]    = (close - df["SUPPORT_1"])    / close * 100
+    df["DIST_RESISTANCE"] = (df["RESISTANCE_1"] - close) / close * 100
+    return df
+
+
+
+# ============================================================
+# 3.5 ADX 门槛：弱趋势时收缩 / 归零分数
+# ============================================================
+def apply_adx_gate(df, adx_threshold=20, mode="shrink"):
+    """
+    用 ADX 做趋势门槛：
+      - mode="shrink"  : ADX < threshold 时，分数按 ADX/threshold 比例向 0 收缩
+      - mode="neutral" : ADX < threshold 时，分数直接归 0（判定为震荡）
+      - mode="off"     : 不做任何处理（保留原行为）
+
+    额外写入列：
+      BIG_SCORE_RAW / SMALL_SCORE_RAW  : ADX 处理前的原始分数
+      ADX_WEAK                         : ADX 是否低于阈值（含 NaN）
+    """
+    df = df.copy()
+
+    # 保留原始分数
+    df["BIG_SCORE_RAW"]   = df["BIG_SCORE"]
+    df["SMALL_SCORE_RAW"] = df["SMALL_SCORE"]
+
+    # ADX NaN 视为无趋势（数据不足，保守处理）
+    adx_filled = df["ADX"].fillna(0.0)
+    df["ADX_WEAK"] = adx_filled < adx_threshold
+
+    if mode == "off":
+        return df
+
+    if mode == "neutral":
+        weak = df["ADX_WEAK"]
+        df.loc[weak, "BIG_SCORE"]   = 0
+        df.loc[weak, "SMALL_SCORE"] = 0
+
+    elif mode == "shrink":
+        # ADX = 0         → 系数 0   （完全归零）
+        # ADX = threshold → 系数 1   （分数不变）
+        # 中间线性插值
+        factor = (adx_filled / adx_threshold).clip(upper=1.0)
+        df["BIG_SCORE"]   = (df["BIG_SCORE"]   * factor).round().astype(int)
+        df["SMALL_SCORE"] = (df["SMALL_SCORE"] * factor).round().astype(int)
+    else:
+        raise ValueError(f"未知 mode: {mode}")
+
+    # 方便 analyze 展示当前模式
+    df.attrs["adx_threshold"] = adx_threshold
+    df.attrs["adx_mode"]      = mode
     return df
 
 
@@ -172,12 +328,27 @@ def analyze(df, date=None):
 
     # ADX 趋势强度
     adx = row["ADX"]
-    if adx >= 25:
+    threshold = df.attrs.get("adx_threshold", 20)
+    mode      = df.attrs.get("adx_mode", "shrink")
+    if pd.isna(adx):
+        adx_txt = "N/A"
+    elif adx >= 25:
         adx_txt = f"{adx:.1f}（趋势强劲）"
-    elif adx >= 20:
+    elif adx >= threshold:
         adx_txt = f"{adx:.1f}（趋势初现）"
     else:
-        adx_txt = f"{adx:.1f}（无趋势/震荡）"
+        tag = "已向 0 收缩" if mode == "shrink" else "已归 0 判定震荡 "
+        adx_txt = f"{adx:.1f} 无趋势/震荡，分数{tag} "
+
+    def _fmt(score, raw):
+        s = int(score)
+        if row["ADX_WEAK"] and int(raw) != s:
+            return f"{s:+d} (原始 {int(raw):+d})"
+        return f"{s:+d}"
+
+    big_disp   = _fmt(row["BIG_SCORE"],   row["BIG_SCORE_RAW"])
+    small_disp = _fmt(row["SMALL_SCORE"], row["SMALL_SCORE_RAW"])
+
 
     print("=" * 62)
     print(f"日期: {row.name.date()}   收盘价: {row['close']:.2f}")
@@ -193,6 +364,41 @@ def analyze(df, date=None):
     print(f"   MA5/10/20     : {row['MA5']:.2f} / {row['MA10']:.2f} / {row['MA20']:.2f}")
     print(f"   日线 MACD     : DIF {row['DIF']:+.3f} / DEA {row['DEA']:+.3f}")
     print(f"   MA20 斜率     : {row['SLOPE_MA20']:+.3f} % / 日")
+
+    # ---------- 支撑 / 阻力 ----------
+    price = row["close"]
+    sup_cols = [f"SUPPORT_{k}"    for k in (1, 2, 3)]
+    res_cols = [f"RESISTANCE_{k}" for k in (1, 2, 3)]
+    supports    = [row[c] for c in sup_cols if not pd.isna(row[c])]
+    resistances = [row[c] for c in res_cols if not pd.isna(row[c])]
+
+    dist_sup = row["DIST_SUPPORT"]
+    dist_res = row["DIST_RESISTANCE"]
+
+    if not supports and not resistances:
+        sr_pos = "数据不足"
+    elif not pd.isna(dist_sup) and dist_sup <= 2:
+        sr_pos = "接近支撑"
+    elif not pd.isna(dist_res) and dist_res <= 2:
+        sr_pos = "接近阻力"
+    elif not pd.isna(dist_sup) and not pd.isna(dist_res):
+        sr_pos = "偏支撑侧" if dist_sup < dist_res else "偏阻力侧"
+    else:
+        sr_pos = "中性"
+
+    print("-" * 62)
+    print("【支撑 / 阻力】")
+    if supports or resistances:
+        for i, s in enumerate(supports, 1):
+            print(f"   支撑 {i}: {s:7.2f}   (距现价 {(price - s) / price * 100:+6.2f}%)")
+        for i, r in enumerate(resistances, 1):
+            print(f"   阻力 {i}: {r:7.2f}   (距现价 {(r - price) / price * 100:+6.2f}%)")
+        print(f"   价格位置: {sr_pos}")
+    else:
+        print("   （历史样本不足）")
+
+
+
     print("-" * 62)
     print(f"【趋势强度】ADX = {adx_txt}")
     print(f"【综合结论】{icon} {desc}")
@@ -201,9 +407,23 @@ def analyze(df, date=None):
 
     return {
         "big_trend": big_state, "big_score": int(row["BIG_SCORE"]),
+        "big_score_raw": int(row["BIG_SCORE_RAW"]),
         "small_trend": small_state, "small_score": int(row["SMALL_SCORE"]),
-        "adx": round(float(adx), 2), "signal": desc, "action": action,
+        "small_score_raw": int(row["SMALL_SCORE_RAW"]),
+        "adx": round(float(adx), 2), 
+        "adx_weak": bool(row["ADX_WEAK"]),
+        "signal": desc, "action": action,
+        "support_1":    float(supports[0])    if supports else None,
+        "support_2":    float(supports[1])    if len(supports) > 1 else None,
+        "support_3":    float(supports[2])    if len(supports) > 2 else None,
+        "resistance_1": float(resistances[0]) if resistances else None,
+        "resistance_2": float(resistances[1]) if len(resistances) > 1 else None,
+        "resistance_3": float(resistances[2]) if len(resistances) > 2 else None,
+        "dist_support":    None if pd.isna(dist_sup) else round(float(dist_sup), 2),
+        "dist_resistance": None if pd.isna(dist_res) else round(float(dist_res), 2),
+        "sr_position":  sr_pos,
     }
+
 
 
 # ============================================================
@@ -211,7 +431,7 @@ def analyze(df, date=None):
 # ============================================================
 if __name__ == "__main__":
     df = get_stock_data('/home/omen/work/quant/data/data_sh.688783_stock_price.csv')
-    df = compute_trend(df)
+    df = compute_trend(df, adx_threshold=20, adx_mode="shrink")
 
     # 最近 20 天的趋势状态
     print("\n最近 20 个交易日趋势状态：")
