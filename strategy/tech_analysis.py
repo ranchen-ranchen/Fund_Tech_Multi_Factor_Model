@@ -95,7 +95,8 @@ def rolling_slope(series, window):
 # 3. 大趋势 / 小趋势 打分
 # ============================================================
 def compute_trend(df, adx_threshold=20, adx_mode="shrink",
-                  pivot_window=5, sr_lookback=120, sr_tolerance=0.015):
+                  pivot_window=5, sr_lookback=120, sr_tolerance=0.015,
+                  enable_volume=True):
     df = df.copy()
     df = add_ma(df)
     df = add_macd(df)
@@ -141,6 +142,16 @@ def compute_trend(df, adx_threshold=20, adx_mode="shrink",
     small["日线MACD多头"] = np.where(df["DIF"] > df["DEA"], 1, -1)
     small["MA20向上"] = np.where(df["SLOPE_MA20"] > 0, 1, -1)
     df["SMALL_SCORE"] = small.sum(axis=1)      # 取值 -4 ~ +4
+
+
+    # ====== 成交量三维分析 ======
+    if enable_volume:
+        df = add_volume_features(df)
+        df = add_breakout_confirmation(df)
+        df = add_trend_health(df)
+        df = add_top_bottom_warning(df)
+    
+
 
     # ---------- ADX 门槛 ----------
     df = apply_adx_gate(df, adx_threshold=adx_threshold, mode=adx_mode)
@@ -291,6 +302,196 @@ def apply_adx_gate(df, adx_threshold=20, mode="shrink"):
     df.attrs["adx_mode"]      = mode
     return df
 
+# ============================================================
+# 3.6 成交量基础指标
+# ============================================================
+def add_volume_features(df):
+    """成交量均线、量比、OBV 等基础衍生指标"""
+    df = df.copy()
+    vol = df["volume"].astype(float)
+
+    df["VOL_MA5"]  = vol.rolling(5).mean()
+    df["VOL_MA20"] = vol.rolling(20).mean()
+    df["VOL_MA60"] = vol.rolling(60).mean()
+
+    # 量比：当日量 / 20 日均量（1 为正常，≥1.5 放量，≤0.6 地量）
+    df["VOL_RATIO"] = vol / df["VOL_MA20"].replace(0, np.nan)
+    df["VOL_RATIO_MA5"] = df["VOL_RATIO"].rolling(5).mean()
+
+    # OBV 能量潮（累积量能方向）
+    sign = np.sign(df["close"].diff()).fillna(0)
+    df["OBV"] = (sign * vol).fillna(0).cumsum()
+    df["OBV_MA20"] = df["OBV"].rolling(20).mean()
+
+    # 成交量 z-score（衡量离群程度）
+    std = vol.rolling(20).std()
+    df["VOL_Z"] = ((vol - df["VOL_MA20"]) / std.replace(0, np.nan)).fillna(0)
+
+    return df
+
+
+# ============================================================
+# 3.7 突破 + 成交量确认
+# ============================================================
+def add_breakout_confirmation(df, vol_ok=1.5, vol_strong=2.0, vol_weak=0.8):
+    """
+    识别突破并用量能确认：
+
+      BREAK_MA20 / BREAK_MA60 / BREAK_RES   是否发生突破（布尔）
+      *_OK                                  放量确认（VOL_RATIO ≥ vol_ok）
+      BREAK_SCORE                           +2 强放量 / +1 普通 / 0 无 / -1 缩量假突破
+      BREAK_TYPE                            文本描述
+    """
+    df = df.copy()
+    close = df["close"]
+    vol_ratio = df["VOL_RATIO"].fillna(1.0)
+
+    prev_close = close.shift(1)
+    prev_ma20  = df["MA20"].shift(1)
+    prev_ma60  = df["MA60"].shift(1)
+    high_60    = df["high"].shift(1).rolling(60, min_periods=20).max()
+
+    df["BREAK_MA20"] = (prev_close <= prev_ma20) & (close > df["MA20"])
+    df["BREAK_MA60"] = (prev_close <= prev_ma60) & (close > df["MA60"])
+    df["BREAK_RES"]  = close > high_60
+
+    df["BREAK_MA20_OK"] = df["BREAK_MA20"] & (vol_ratio >= vol_ok)
+    df["BREAK_MA60_OK"] = df["BREAK_MA60"] & (vol_ratio >= vol_ok)
+    df["BREAK_RES_OK"]  = df["BREAK_RES"]  & (vol_ratio >= vol_ok)
+
+    any_break = df["BREAK_MA20"] | df["BREAK_MA60"] | df["BREAK_RES"]
+    any_ok    = df["BREAK_MA20_OK"] | df["BREAK_MA60_OK"] | df["BREAK_RES_OK"]
+    weak      = any_break & (vol_ratio < vol_weak)
+    strong    = any_ok    & (vol_ratio >= vol_strong)
+
+    score = pd.Series(0, index=df.index, dtype=int)
+    score[any_break] = 1
+    score[weak]      = -1
+    score[strong]    = 2
+    df["BREAK_SCORE"] = score
+
+    def _type(r):
+        tags = []
+        if r["BREAK_MA20"]: tags.append("MA20")
+        if r["BREAK_MA60"]: tags.append("MA60")
+        if r["BREAK_RES"]:  tags.append("前高")
+        if not tags:
+            return ""
+        confirmed = r["BREAK_MA20_OK"] or r["BREAK_MA60_OK"] or r["BREAK_RES_OK"]
+        return f"{'放量' if confirmed else '缩量'}突破({'/'.join(tags)})"
+
+    df["BREAK_TYPE"] = df.apply(_type, axis=1)
+    return df
+
+
+# ============================================================
+# 3.8 趋势健康度
+# ============================================================
+def add_trend_health(df, window=20):
+    """
+    趋势健康度（-100 ~ +100）：
+      · 量能结构：上涨日均量 / 下跌日均量  —— 价涨量增、价跌量缩才健康
+      · OBV 一致性：OBV 斜率与价格斜率同向加分
+      · 量价相关性：收益与量变化的正相关强弱
+    """
+    df = df.copy()
+    vol = df["volume"].astype(float)
+    ret = df["close"].pct_change()
+
+    up_mask = ret > 0
+    dn_mask = ret < 0
+    up_avg = vol.where(up_mask).rolling(window, min_periods=5).mean()
+    dn_avg = vol.where(dn_mask).rolling(window, min_periods=5).mean()
+    ratio = (up_avg / dn_avg.replace(0, np.nan)).fillna(1.0)
+    # ratio = 1 → 0；ratio = 2 → +50；ratio = 0.5 → -50
+    df["VOL_HEALTH"] = (np.log2(ratio) * 50).clip(-100, 100)
+
+    price_slope = rolling_slope(df["close"], window)
+    obv_slope   = rolling_slope(df["OBV"], window)
+    agree = np.sign(price_slope) * np.sign(obv_slope)
+    df["OBV_AGREE"] = agree.fillna(0).astype(int)   # +1 同向 / -1 背离
+
+    vol_chg = vol.pct_change().replace([np.inf, -np.inf], np.nan)
+    pv_corr = ret.rolling(window).corr(vol_chg).fillna(0)
+
+    health = df["VOL_HEALTH"] * 0.5 + df["OBV_AGREE"] * 25 + pv_corr * 25
+    df["TREND_HEALTH"] = health.clip(-100, 100)
+    return df
+
+
+# ============================================================
+# 3.9 顶部 / 底部预警
+# ============================================================
+def add_top_bottom_warning(df, lookback=60,
+                           high_zone=0.95, low_zone=1.05,
+                           huge_vol=2.5, dry_vol=0.5):
+    """
+    顶部预警（≥2 项触发）：
+      · 高位巨量滞涨（收阴 + 量比 ≥ huge_vol + 接近 60 日高点）
+      · 长上影巨量（上影线 > 2 倍实体 + 巨量 + 高位）
+      · OBV 顶背离（价格创新高，OBV 未创新高）
+
+    底部预警（≥2 项触发）：
+      · 低位地量（量比 ≤ dry_vol + 接近 60 日低点）
+      · 放量反弹（阳线 + 量比 ≥ 1.5 + 前 5 日均量萎缩）
+      · OBV 底背离
+    """
+    df = df.copy()
+    high, low = df["high"], df["low"]
+    close, open_ = df["close"], df["open"]
+    vol_ratio = df["VOL_RATIO"].fillna(1.0)
+
+    roll_high = high.rolling(lookback, min_periods=20).max()
+    roll_low  = low.rolling(lookback, min_periods=20).min()
+    near_high = close >= roll_high * high_zone
+    near_low  = close <= roll_low  * low_zone
+
+    # -------- 顶部信号 --------
+    sig_top_vol = near_high & (vol_ratio >= huge_vol) & (close < open_)
+
+    body = (close - open_).abs().replace(0, np.nan)
+    upper_shadow = high - np.maximum(close, open_)
+    sig_top_shadow = (upper_shadow > 2 * body) & (vol_ratio >= huge_vol) & near_high
+
+    obv_high = df["OBV"].rolling(lookback, min_periods=20).max()
+    sig_top_div = (close >= roll_high) & (df["OBV"] < obv_high)
+
+    df["TOP_SIGNALS"] = (
+        sig_top_vol.astype(int) + sig_top_shadow.astype(int) + sig_top_div.astype(int)
+    )
+    df["TOP_WARN"] = df["TOP_SIGNALS"] >= 2
+
+    # -------- 底部信号 --------
+    sig_bot_dry = near_low & (vol_ratio <= dry_vol)
+
+    vol_ratio_prev5 = df["VOL_RATIO"].shift(1).rolling(5).mean()
+    sig_bot_rebound = (close > open_) & (vol_ratio >= 1.5) & (vol_ratio_prev5 < 0.8) & near_low
+
+    obv_low = df["OBV"].rolling(lookback, min_periods=20).min()
+    sig_bot_div = (low <= roll_low) & (df["OBV"] > obv_low)
+
+    df["BOTTOM_SIGNALS"] = (
+        sig_bot_dry.astype(int) + sig_bot_rebound.astype(int) + sig_bot_div.astype(int)
+    )
+    df["BOTTOM_WARN"] = df["BOTTOM_SIGNALS"] >= 2
+
+    # 文本原因
+    df["TOP_REASON"] = ""
+    df.loc[sig_top_vol,    "TOP_REASON"] += "高位巨量滞涨;"
+    df.loc[sig_top_shadow, "TOP_REASON"] += "长上影巨量;"
+    df.loc[sig_top_div,    "TOP_REASON"] += "OBV顶背离;"
+    df["TOP_REASON"] = df["TOP_REASON"].replace("", np.nan)
+
+    df["BOTTOM_REASON"] = ""
+    df.loc[sig_bot_dry,     "BOTTOM_REASON"] += "低位地量;"
+    df.loc[sig_bot_rebound, "BOTTOM_REASON"] += "放量反弹;"
+    df.loc[sig_bot_div,     "BOTTOM_REASON"] += "OBV底背离;"
+    df["BOTTOM_REASON"] = df["BOTTOM_REASON"].replace("", np.nan)
+
+    return df
+
+
+
 
 # ============================================================
 # 4. 综合研判
@@ -398,6 +599,35 @@ def analyze(df, date=None):
         print("   （历史样本不足）")
 
 
+    # ---------- 量价分析 ----------
+    print("-" * 62)
+    print("【量价分析】")
+    vol_ratio = row.get("VOL_RATIO", np.nan)
+    if not pd.isna(vol_ratio):
+        if   vol_ratio >= 2.0: tag = "巨量"
+        elif vol_ratio >= 1.5: tag = "放量"
+        elif vol_ratio <= 0.6: tag = "地量"
+        elif vol_ratio <= 0.8: tag = "缩量"
+        else: tag = "正常"
+        print(f"   量比 VOL/MA20 : {vol_ratio:.2f}（{tag}）  VOL_MA5/MA20 = {row['VOL_MA5']/row['VOL_MA20']:.2f}")
+
+    health = row.get("TREND_HEALTH", np.nan)
+    if not pd.isna(health):
+        if   health >=  40: htxt = f"{health:+.0f}（健康）"
+        elif health >=   0: htxt = f"{health:+.0f}（一般）"
+        elif health >= -40: htxt = f"{health:+.0f}（偏弱）"
+        else:               htxt = f"{health:+.0f}（不健康）"
+        print(f"   趋势健康度    : {htxt}   （量能结构 {row['VOL_HEALTH']:+.0f} / OBV一致 {row['OBV_AGREE']:+d}）")
+
+    bt = row.get("BREAK_TYPE", "")
+    if bt:
+        print(f"   突破信号      : {bt}  (BREAK_SCORE = {row['BREAK_SCORE']:+d})")
+
+    if row.get("TOP_WARN", False):
+        print(f"   ⚠️  顶部预警   : {row['TOP_REASON']}")
+    if row.get("BOTTOM_WARN", False):
+        print(f"   🔔 底部预警   : {row['BOTTOM_REASON']}")
+
 
     print("-" * 62)
     print(f"【趋势强度】ADX = {adx_txt}")
@@ -422,6 +652,14 @@ def analyze(df, date=None):
         "dist_support":    None if pd.isna(dist_sup) else round(float(dist_sup), 2),
         "dist_resistance": None if pd.isna(dist_res) else round(float(dist_res), 2),
         "sr_position":  sr_pos,
+                "vol_ratio":       None if pd.isna(row.get("VOL_RATIO", np.nan)) else round(float(row["VOL_RATIO"]), 2),
+        "trend_health":    None if pd.isna(row.get("TREND_HEALTH", np.nan)) else round(float(row["TREND_HEALTH"]), 1),
+        "break_type":      row.get("BREAK_TYPE", "") or None,
+        "break_score":     int(row.get("BREAK_SCORE", 0)),
+        "top_warn":        bool(row.get("TOP_WARN", False)),
+        "top_reason":      None if pd.isna(row.get("TOP_REASON")) else row["TOP_REASON"],
+        "bottom_warn":     bool(row.get("BOTTOM_WARN", False)),
+        "bottom_reason":   None if pd.isna(row.get("BOTTOM_REASON")) else row["BOTTOM_REASON"],
     }
 
 
@@ -435,7 +673,9 @@ if __name__ == "__main__":
 
     # 最近 20 天的趋势状态
     print("\n最近 20 个交易日趋势状态：")
-    print(df[["close", "BIG_SCORE", "SMALL_SCORE", "ADX"]].tail(20).round(2))
+    print(df[["close", "BIG_SCORE", "SMALL_SCORE", "ADX",
+              "VOL_RATIO", "TREND_HEALTH", "BREAK_SCORE",
+              "TOP_WARN", "BOTTOM_WARN"]].tail(20).round(2))
 
     # 最新一天的完整研判
     result = analyze(df)
