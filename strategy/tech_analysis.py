@@ -16,17 +16,18 @@
 
 import pandas as pd
 import numpy as np
-import sys
-from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
 
-from utils.text_utils import read_from_csv
 
 
 
 
 def get_stock_data(filename):
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root))
+    from utils.text_utils import read_from_csv
+    
     df = read_from_csv(filename)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
