@@ -56,29 +56,218 @@ def read_from_csv(filename:str) -> pd.DataFrame:
 
 
 
+import pandas as pd
+def read_hs300_constituents(csv_path: str, 
+                    encoding: str = "utf-8-sig",
+                    parse_date: bool = False) -> pd.DataFrame:
+    """
+    从CSV文件中读取 query_date 和 code 两列，返回 DataFrame。
+
+    参数
+    ----------
+    csv_path : str
+        CSV 文件路径。
+    encoding : str, 默认 'utf-8'
+        文件编码。若为中文 Windows 导出的文件，可尝试 'gbk' 或 'utf-8-sig'。
+    parse_date : bool, 默认 False
+        是否将 query_date 解析为 datetime 类型。
+
+    返回
+    -------
+    pd.DataFrame
+        包含 'query_date' 和 'code' 两列的 DataFrame。
+    """
+    df = pd.read_csv(
+        csv_path,
+        usecols=["query_date", "code"],   # 只读取需要的列
+        encoding=encoding,
+        dtype={"code": str},              # 股票代码保留为字符串，避免前导 0 丢失
+    )
+
+    if parse_date:
+        df["query_date"] = pd.to_datetime(df["query_date"], errors="coerce")
+
+    df["code"] = df["code"].astype(str).str.replace(r"[A-Za-z.]", "", regex=True)
+    # 重置索引并去除缺失行
+    df = df.dropna(subset=["query_date", "code"]).reset_index(drop=True)
+
+    return df
+
+
+
+def read_business_description(csv_path: str, encoding: str = "utf-8-sig") -> pd.DataFrame:
+    """
+    从给定的 CSV 文件读取股票数据。
+
+    参数:
+        csv_path: CSV 文件路径
+        encoding: 文件编码，默认为 'utf-8'，如果是中文 Windows 导出的可尝试 'gbk'
+
+    返回:
+        pandas DataFrame，包含两列：
+            - code: 股票代码
+            - description: 由 主营业务、产品类型、产品名称、经营范围 合并而成
+    """
+    # 1. 读取 CSV（读取为字符串，避免股票代码被转成数字丢前导 0）
+    df = pd.read_csv(csv_path, dtype=str, encoding=encoding)
+
+    # 2. 校验列是否存在
+    code_col = "股票代码"
+    desc_cols = ["主营业务", "产品类型", "产品名称", "经营范围"]
+    missing = [c for c in [code_col] + desc_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV 文件缺少以下列: {missing}")
+
+    # 3. 构造结果 DataFrame
+    result = pd.DataFrame()
+    result["code"] = df[code_col].fillna("").str.strip()
+
+    # 4. 合并描述列：去掉空值/NaN，用分隔符连接
+    def merge_description(row):
+        parts = []
+        for col in desc_cols:
+            val = row.get(col)
+            if pd.isna(val):
+                continue
+            val = str(val).strip()
+            if val:
+                parts.append(f"{col}：{val}")
+        return "；".join(parts)
+
+    result["description"] = df.apply(merge_description, axis=1)
+
+    return result.reset_index(drop=True)
+
+
+def match_business_description(path_hs300, path_business_des, date, code_col='code', reset_index=True):
+    """
+    找出 df1 和 df2 中 code 列值相同的元素，
+    将 df2 中 code 值属于该交集的行提取出来，返回新的 DataFrame。
+
+    参数：
+        df1, df2    : pandas DataFrame，均包含 code_col 列
+        code_col    : code 列名，默认 'code'
+        reset_index : 是否重置结果的行索引，默认 True
+
+    返回：
+        pandas DataFrame：df2 中 code 值也出现在 df1 中的行
+    """
+    hs_cons = read_hs300_constituents(path_hs300)
+    df1 = hs_cons[hs_cons['query_date'] == date]
+    df2 = read_business_description(path_business_des)
+
+
+    # 取两个 code 列的非空值交集
+    common_codes = set(df1[code_col].dropna()) & set(df2[code_col].dropna())
+    # 从 df2 中筛选出 code 属于交集的行
+    result = df2[df2[code_col].isin(common_codes)].copy()
+    if reset_index:
+        result = result.reset_index(drop=True)
+    return result
+
+
+def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv', path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root))
+    result = match_business_description(path_hs300 = path_stock, path_business_des = path_description, date = query_date).to_dict(orient="records")
+    from strategy.eval_business_prosperity import batch_evaluate, flatten_results
+    df_result = batch_evaluate(result)
+    print("\n" + "-" * 70)
+    print("景气度评估结果汇总")
+    print("-" * 70)
+    display_cols = [
+            "company_code", "total_score", "prosperity_level",
+            "trend",
+    ]
+    available_cols = [c for c in display_cols if c in df_result.columns]
+    print(df_result[available_cols].to_string(index=False))
+    if not df_result.empty:
+        output_df = flatten_results(df_result)
+        output_df.to_csv(
+                "prosperity_results.csv",
+                index=False,
+                encoding="utf-8-sig",
+        )
+        print("\n完整结果已保存至 prosperity_results.csv")
+
+    print("\n" + "-" * 70)
+    print("景气等级分布统计")
+    print("-" * 70)
+    if "prosperity_level" in df_result.columns:
+        print(df_result["prosperity_level"].value_counts().to_string())
+
+    if "total_score" in df_result.columns:
+        print("\n平均景气度得分：", round(df_result["total_score"].mean(skipna=True), 2))
+
+
+def fund_screen_policy_match(path_stock = 'data/hs300_constituents_2021_2026.csv', path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root))
+    result = match_business_description(path_hs300 = path_stock, path_business_des = path_description, date = query_date).to_dict(orient="records")
+    from strategy.eval_policy_match import batch_evaluate
+    df_result = batch_evaluate(result)
+    print("\n" + "=" * 60)
+    print("评估结果汇总")
+    print("=" * 60)
+    # 展示核心字段
+    display_cols = ["company_code", "total_score", "match_level"]
+    available_cols = [c for c in display_cols if c in df_result.columns]
+    print(df_result[available_cols].to_string(index=False))
+    # 保存完整结果到 CSV（展开 JSON 字段）
+    if not df_result.empty:
+        # 提取维度得分
+        for dim in ["policy_direction", "tech_content",
+            "industry_chain", "growth_prospect"]:
+            df_result[f"{dim}_score"] = df_result.apply(
+                    lambda r: r.get("dimensions", {}).get(dim, {}).get("score")
+                    if isinstance(r.get("dimensions"), dict) else None,
+                    axis=1,
+                )
+            df_result[f"{dim}_reason"] = df_result.apply(
+                    lambda r: r.get("dimensions", {}).get(dim, {}).get("reason")
+                    if isinstance(r.get("dimensions"), dict) else None,
+                    axis=1,
+                )
+
+        # 提取摘要和关键词
+        df_result["summary"] = df_result.apply(
+                lambda r: r.get("summary", ""), axis=1
+            )
+        df_result["policy_keywords"] = df_result.apply(
+                lambda r: ", ".join(r.get("policy_keywords", []))
+                if isinstance(r.get("policy_keywords"), list) else "",
+                axis=1,
+            )
+
+        # 删除原始嵌套列，保存扁平化结果
+        output_df = df_result.drop(
+                columns=["dimensions"], errors="ignore"
+            )
+        output_df.to_csv(
+                "policy_match_results.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+        print("\n完整结果已保存至 policy_match_results.csv")
+
+    # ---------- 6.4 快速统计 ----------
+    print("\n" + "=" * 60)
+    print("契合度分布统计")
+    print("=" * 60)
+    if "match_level" in df_result.columns:
+        print(df_result["match_level"].value_counts().to_string())
 
 
 
 
-# def read_from_csv(filename:str, date:str) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
-#     df = pd.read_csv(filename, dtype=str)
-#     date_bound = df['date'][0]
-#     check_date = (df['date'] == date).any()
-#     while check_date == False:
-#         date = add_days_to_date(date, -1)
-#         if check_date_out_bound(date_bound, date):
-#             raise ValueError("date is out of the boundary!!!") 
-#         else:
-#             check_date = (df['date'] == date).any()
 
-#     end = df[df['date'] == date].index[0]
-#     start = max(0, end - time_window)
-#     open_series = df['open'].astype(float).iloc[start:end+1]
-#     close_series = df['close'].astype(float).iloc[start:end+1]
-#     high_series = df['high'].astype(float).iloc[start:end+1]
-#     low_series = df['low'].astype(float).iloc[start:end+1]
-#     amount_series = df['amount'].astype(float).iloc[start:end+1]
-#     return open_series, close_series, high_series, low_series, amount_series
 
-#     # turn_series = df['turn'].fillna(0).astype(float)
+
+
+
+
 

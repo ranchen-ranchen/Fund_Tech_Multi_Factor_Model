@@ -1,22 +1,31 @@
-
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
 import yaml
 from pathlib import Path
 import logging
-logger = logging.getLogger(__name__) 
+
+logger = logging.getLogger(__name__)
+
 # 加载 .env 文件中的环境变量
 load_dotenv()
+
 # 读取环境变量
 api_key = os.getenv("DEEPSEEK_API_KEY")
 base_url = os.getenv("DEEPSEEK_BASE_URL")
 
-config_path = Path(__file__).parent.parent / 'config' / 'settings.yaml'
-with open(config_path, 'r', encoding='utf-8') as file:
-    config = yaml.safe_load(file)
+# 可选：读取项目配置文件
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
+config: dict = {}
+if CONFIG_PATH.exists():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取配置文件失败: %s", e)
 
-fund_screen_threshold = config['FUND_SCREEN_THRESHOLD']
+MODEL_NAME = config.get("MODEL_NAME", "deepseek-flash")  # 可用模型：deepseek-flash（轻量快速）、deepseek-v4-pro（能力更强）
+MAX_WORKERS = config.get("MAX_WORKERS", 3)  # 并发线程数（控制 API 速率，避免触发限流）
 
 import json
 import re
@@ -29,18 +38,11 @@ import pandas as pd
 # 1. 配置区
 # ============================================================
 
-
-# DeepSeek API 使用 OpenAI 兼容格式[reference:0]
+# DeepSeek API 使用 OpenAI 兼容格式
 client = OpenAI(
     api_key=api_key,
     base_url=base_url
 )
-
-# 可用模型：deepseek-flash（轻量快速）、deepseek-v4-pro（能力更强）[reference:1]
-MODEL_NAME = "deepseek-flash"
-
-# 并发线程数（控制 API 速率，避免触发限流）
-MAX_WORKERS = 3
 
 # ============================================================
 # 2. 产业政策文本（可替换为从文件/数据库读取）
@@ -81,14 +83,9 @@ INDUSTRY_POLICY_TEXT = """
     数字化应用场景：在智能交通、智慧物流、智慧能源、智慧医疗等重点领域开展试点示范，深入推进服务业数字化转型。
 """
 
-
-
-
-
-
 # INDUSTRY_POLICY_TEXT = """
 # 国家产业政策重点方向（2026年，依据"十五五"规划纲要及政府工作报告）：
-
+#
 # 一、新兴支柱产业（优先支持）：
 # - 集成电路：芯片设计、制造、封装测试、半导体设备与材料
 # - 航空航天：商业航天、国产大飞机、低空装备
@@ -96,13 +93,13 @@ INDUSTRY_POLICY_TEXT = """
 # - 低空经济：eVTOL、无人机物流、低空基础设施
 # - 新型储能：锂电储能、钠电储能、氢能储运、压缩空气储能
 # - 智能机器人：人形机器人、工业机器人、核心零部件
-
+#
 # 二、未来产业（前瞻布局）：
 # - 量子科技、生物制造、氢能与核聚变能、脑机接口、具身智能、6G通信
-
+#
 # 三、传统产业改造升级：
 # - 高端新材料、基础零部件和元器件、大型邮轮、LNG运输船、CR450动车组、农机装备、燃气轮机
-
+#
 # 四、数字经济与人工智能：
 # - 人工智能大模型、算力基础设施、数据要素、工业互联网、智能制造
 # """
@@ -125,9 +122,9 @@ SYSTEM_PROMPT = """你是一位资深的产业政策研究分析师，专门评�
 
 USER_PROMPT_TEMPLATE = """请评估以下上市公司主营业务与国家产业政策的契合程度。
 
-【公司名称】{company_name}
+【公司代码】{company_code}
 【主营业务描述】
-{business_description}
+{description}
 
 【国家产业政策文本】
 {policy_text}
@@ -135,7 +132,7 @@ USER_PROMPT_TEMPLATE = """请评估以下上市公司主营业务与国家产业
 请严格按照以下 JSON 结构输出（不要输出任何其他内容）：
 
 {{
-  "company_name": "公司名称",
+  "company_code": "公司代码",
   "total_score": 0-100的整数,
   "match_level": "高度契合/中度契合/轻度契合/不契合",
   "dimensions": {{
@@ -166,14 +163,13 @@ USER_PROMPT_TEMPLATE = """请评估以下上市公司主营业务与国家产业
 - 轻度契合：40-59分，业务与政策有部分关联，但关联度有限
 - 不契合：0-39分，主营业务与政策方向无明显关联"""
 
-
 # ============================================================
 # 4. 核心评估函数
 # ============================================================
 
 def evaluate_company(
-    company_name: str,
-    business_description: str,
+    company_code: str,
+    description: str,
     policy_text: str = INDUSTRY_POLICY_TEXT,
     max_retries: int = 3,
 ) -> dict:
@@ -183,8 +179,8 @@ def evaluate_company(
     返回结构化 dict，包含评分、等级、各维度理由等。
     """
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        company_name=company_name,
-        business_description=business_description,
+        company_code=company_code,
+        description=description,
         policy_text=policy_text,
     )
 
@@ -213,6 +209,9 @@ def evaluate_company(
             if "total_score" not in result:
                 raise ValueError("LLM 返回缺少 total_score 字段")
 
+            # 确保公司代码字段存在
+            result.setdefault("company_code", company_code)
+
             # 归一化：确保总分等于四个维度之和（防止 LLM 算错）
             dims = result.get("dimensions", {})
             dim_sum = sum(
@@ -228,22 +227,21 @@ def evaluate_company(
             return result
 
         except json.JSONDecodeError as e:
-            print(f"  [{company_name}] JSON 解析失败 (尝试 {attempt+1}/{max_retries}): {e}")
+            print(f"  [{company_code}] JSON 解析失败 (尝试 {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # 指数退避
         except Exception as e:
-            print(f"  [{company_name}] API 调用失败 (尝试 {attempt+1}/{max_retries}): {e}")
+            print(f"  [{company_code}] API 调用失败 (尝试 {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
 
     return {
-        "company_name": company_name,
+        "company_code": company_code,
         "total_score": None,
         "match_level": "评估失败",
         "_status": "failed",
         "_error": "达到最大重试次数",
     }
-
 
 # ============================================================
 # 5. 批量评估函数（并发）
@@ -260,7 +258,7 @@ def batch_evaluate(
     参数
     ----
     companies : list[dict]
-        每项格式：{"name": "公司名称", "business": "主营业务描述"}
+        每项格式：{"code": "公司代码", "description": "主营业务描述"}
     policy_text : str
         产业政策文本，可针对不同行业替换
     max_workers : int
@@ -276,25 +274,26 @@ def batch_evaluate(
         future_map = {
             executor.submit(
                 evaluate_company,
-                c["name"],
-                c["business"],
+                c["code"],
+                c["description"],
                 policy_text,
-            ): c["name"]
+            ): c["code"]
             for c in companies
         }
 
         for future in as_completed(future_map):
-            name = future_map[future]
+            code = future_map[future]
             try:
                 result = future.result()
+                result["company_code"] = code
                 results.append(result)
                 score = result.get("total_score", "N/A")
                 level = result.get("match_level", "N/A")
-                print(f"  ✓ {name}: {score} 分 ({level})")
+                print(f"  ✓ {code}: {score} 分 ({level})")
             except Exception as e:
-                print(f"  ✗ {name}: 异常 - {e}")
+                print(f"  ✗ {code}: 异常 - {e}")
                 results.append({
-                    "company_name": name,
+                    "company_code": code,
                     "total_score": None,
                     "match_level": "评估失败",
                     "_status": "failed",
@@ -308,7 +307,6 @@ def batch_evaluate(
 
     return df
 
-
 # ============================================================
 # 6. 主流程示例
 # ============================================================
@@ -321,8 +319,8 @@ if __name__ == "__main__":
     print("=" * 60)
 
     single_result = evaluate_company(
-        company_name="XX半导体股份有限公司",
-        business_description=(
+        company_code="688XXX",
+        description=(
             "公司主要从事集成电路芯片的设计、研发与销售，"
             "产品覆盖模拟芯片、射频前端芯片，应用于5G通信、"
             "汽车电子和物联网领域。公司拥有自主研发的芯片架构，"
@@ -340,29 +338,29 @@ if __name__ == "__main__":
     # 实际使用时，可以从 Excel/CSV 读取：
     #   df_input = pd.read_csv("companies.csv")
     #   companies = [
-    #       {"name": row["公司名称"], "business": row["主营业务描述"]}
+    #       {"code": row["公司代码"], "description": row["主营业务描述"]}
     #       for _, row in df_input.iterrows()
     #   ]
     companies_to_evaluate = [
         {
-            "name": "A公司",
-            "business": "公司专注于人形机器人的整机设计与核心零部件（谐波减速器、伺服电机）的研发制造，产品面向工业制造和服务场景。"
+            "code": "A001",
+            "description": "公司专注于人形机器人的整机设计与核心零部件（谐波减速器、伺服电机）的研发制造，产品面向工业制造和服务场景。"
         },
         {
-            "name": "B公司",
-            "business": "公司主营业务为传统燃煤发电，同时涉足少量光伏电站运营。"
+            "code": "B001",
+            "description": "公司主营业务为传统燃煤发电，同时涉足少量光伏电站运营。"
         },
         {
-            "name": "C公司",
-            "business": "公司从事创新药研发，聚焦肿瘤免疫治疗领域的单克隆抗体和CAR-T细胞疗法，拥有多个临床阶段管线。"
+            "code": "C001",
+            "description": "公司从事创新药研发，聚焦肿瘤免疫治疗领域的单克隆抗体和CAR-T细胞疗法，拥有多个临床阶段管线。"
         },
         {
-            "name": "D公司",
-            "business": "公司主营商业航天运载火箭的研制与发射服务，同时布局卫星互联网星座建设。"
+            "code": "D001",
+            "description": "公司主营商业航天运载火箭的研制与发射服务，同时布局卫星互联网星座建设。"
         },
         {
-            "name": "E公司",
-            "business": "公司主要从事房地产开发与销售，兼营物业管理服务。"
+            "code": "E001",
+            "description": "公司主要从事房地产开发与销售，兼营物业管理服务。"
         },
     ]
 
@@ -374,7 +372,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 展示核心字段
-    display_cols = ["company_name", "total_score", "match_level"]
+    display_cols = ["company_code", "total_score", "match_level"]
     available_cols = [c for c in display_cols if c in df_result.columns]
     print(df_result[available_cols].to_string(index=False))
 
@@ -421,9 +419,3 @@ if __name__ == "__main__":
     print("=" * 60)
     if "match_level" in df_result.columns:
         print(df_result["match_level"].value_counts().to_string())
-
-
-
-
-
-

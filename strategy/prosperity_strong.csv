@@ -1,5 +1,5 @@
-﻿company_name,total_score,prosperity_level,trend,confidence_level,confidence_score
-B公司,78,景气上行,上行,中,65
-C公司,68,景气上行,上行,低,40
-D公司,68,景气上行,上行,中,58
-A公司,67,景气上行,上行,中,62
+﻿company_code,total_score,prosperity_level,trend
+B001,78,景气上行,上行
+D001,74,景气上行,上行
+A001,72,景气上行,上行
+C001,70,景气上行,上行

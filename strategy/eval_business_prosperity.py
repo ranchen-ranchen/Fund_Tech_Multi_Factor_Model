@@ -4,7 +4,7 @@
 时间视角：站在 2021 年初，展望未来五年（2021-2026）
 判断依据：给定公司业务描述 + 一般行业知识 + 一般技术发展趋势
 约束条件：不依赖具体财务数据，不引用 2021 年之后才发生的事件
-输出要求：必须给出景气度总分、等级、趋势方向、置信度与不确定性说明
+输出要求：必须给出景气度总分、等级、趋势方向与不确定性说明
 """
 
 import os
@@ -27,12 +27,10 @@ logger = logging.getLogger(__name__)
 # 1. 配置区
 # ============================================================
 
-# 加载 .env 文件中的环境变量
 load_dotenv()
 api_key = os.getenv("DEEPSEEK_API_KEY")
 base_url = os.getenv("DEEPSEEK_BASE_URL")
 
-# 可选：读取项目配置文件
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
 config: dict = {}
 if CONFIG_PATH.exists():
@@ -42,33 +40,24 @@ if CONFIG_PATH.exists():
     except Exception as e:  # noqa: BLE001
         logger.warning("读取配置文件失败: %s", e)
 
-# 景气度筛选阈值：低于该分数的公司视为“景气偏弱”
 PROSPERITY_SCREEN_THRESHOLD = config.get("PROSPERITY_SCREEN_THRESHOLD", 60)
-# 低置信度阈值：置信度分数低于该值的结论需人工复核
-CONFIDENCE_REVIEW_THRESHOLD = config.get("CONFIDENCE_REVIEW_THRESHOLD", 50)
+MODEL_NAME = config.get("MODEL_NAME", "deepseek-flash")
+MAX_WORKERS = config.get("MAX_WORKERS", 3)
 
-# DeepSeek API 使用 OpenAI 兼容格式
 client = OpenAI(api_key=api_key, base_url=base_url)
 
-# 可用模型：deepseek-flash（轻量快速）、deepseek-v4-pro（能力更强）
-MODEL_NAME = "deepseek-flash"
-
-# 并发线程数（控制 API 速率，避免触发限流）
-MAX_WORKERS = 3
-
 # ---------- 时间视角设定 ----------
-BASE_YEAR = 2021                       # 评估基准年份：站在这一年年初
-FORECAST_HORIZON_YEARS = 5             # 展望未来五年
-AS_OF_DATE = f"{BASE_YEAR}-01-01"      # 评估基准日期
-OUTLOOK_WINDOW = f"{BASE_YEAR}-{BASE_YEAR + FORECAST_HORIZON_YEARS}"  # 2021-2026
+BASE_YEAR = 2021
+FORECAST_HORIZON_YEARS = 5
+AS_OF_DATE = f"{BASE_YEAR}-01-01"
+OUTLOOK_WINDOW = f"{BASE_YEAR}-{BASE_YEAR + FORECAST_HORIZON_YEARS}"
 
-# 各维度满分（用于归一化与合法性截断）
 DIMENSION_MAX = {
-    "demand": 25,               # 未来五年需求扩张的确定性
-    "supply_competition": 20,   # 供给投放节奏与竞争格局演变
-    "tech_trajectory": 20,      # 技术路线演进方向与业务卡位
-    "policy_environment": 15,   # 政策与外部环境（2021 年初已知）
-    "company_position": 20,     # 公司在产业链中的定位与能力积累
+    "demand": 25,
+    "supply_competition": 20,
+    "tech_trajectory": 20,
+    "policy_environment": 15,
+    "company_position": 20,
 }
 
 
@@ -92,7 +81,7 @@ SYSTEM_PROMPT = f"""你是一位资深的产业研究员，正在以 **{BASE_YEA
    (c) 一般技术发展趋势知识（技术路线演进方向、渗透率提升逻辑、替代关系）。
 5. 严禁依赖或编造具体财务数据，包括但不限于：营收、利润、毛利率、订单金额、产能数字、市占率具体百分比、股价、估值。
    可以使用方向性、定性表述（如“需求有望扩张”“供给可能偏紧”），但不得给出精确数字。
-6. 如果公司业务描述信息不足，应明确指出信息缺口，并相应降低置信度，而不是自行补全。
+6. 如果公司业务描述信息不足，应明确指出信息缺口，并相应降低判断的确定性，而不是自行补全。
 
 【评估维度】
 7. 从以下五个维度综合评估：
@@ -101,25 +90,18 @@ SYSTEM_PROMPT = f"""你是一位资深的产业研究员，正在以 **{BASE_YEA
    - 技术路线演进：主流技术路线是否清晰、公司业务是否卡在趋势方向上、是否存在被替代风险
    - 政策与外部环境：{BASE_YEAR} 年初已知的产业政策、监管导向、贸易与地缘环境的可能影响方向
    - 公司自身定位：基于业务描述判断其在产业链中的位置、客户结构、技术积累与壁垒
-8. 最终给出 0-100 的景气度总分、景气等级、趋势方向，以及置信度。
+8. 最终给出 0-100 的景气度总分、景气等级、趋势方向。
 
-【置信度与不确定性】
-9. 必须显式输出置信度，包括：
-   - confidence_level：高 / 中 / 低
-   - confidence_score：0-100 的整数
-   - confidence_reason：给出该置信度的理由
-10. 对不确定性保持谨慎：
-    - 信息不足、技术路线存在多条可能、政策方向不明、需求依赖单一变量时，必须下调置信度。
-    - 不得为了显得自信而虚高置信度；宁可能力边界说清楚，也不要给出过度确定的结论。
-11. 必须输出 uncertainty_notes，列出 2-4 条最主要的不确定性来源。
+【不确定性】
+9. 必须输出 uncertainty_notes，列出 2-4 条最主要的不确定性来源。
 
 【输出格式】
-12. 必须严格以 JSON 格式输出，不得包含 JSON 之外的任何文字。"""
+10. 必须严格以 JSON 格式输出，不得包含 JSON 之外的任何文字。"""
 
 
 USER_PROMPT_TEMPLATE = """请以 {as_of_date} 的视角，评估以下上市公司主营业务在未来五年（{outlook_window}）的景气度预期。
 
-【公司名称】{company_name}
+【公司代码】{company_code}
 【主营业务描述】
 {business_description}
 
@@ -134,13 +116,10 @@ USER_PROMPT_TEMPLATE = """请以 {as_of_date} 的视角，评估以下上市公�
 请严格按照以下 JSON 结构输出（不要输出任何其他内容）：
 
 {{
-  "company_name": "公司名称",
+  "company_code": "公司代码",
   "total_score": 0-100的整数,
   "prosperity_level": "高景气/景气上行/景气平稳/景气下行/景气低迷",
   "trend": "上行/持平/下行",
-  "confidence_level": "高/中/低",
-  "confidence_score": 0-100的整数,
-  "confidence_reason": "为什么给出该置信度的简要理由",
   "dimensions": {{
     "demand": {{
       "score": 0-25的整数,
@@ -174,12 +153,7 @@ USER_PROMPT_TEMPLATE = """请以 {as_of_date} 的视角，评估以下上市公�
 - 景气上行 65-79：需求趋势向上，但节奏或幅度存在一定不确定性
 - 景气平稳 45-64：供需大体平衡，缺乏明确的向上或向下催化
 - 景气下行 25-44：需求趋弱或供给过剩压力上升，技术路线存在被替代风险
-- 景气低迷 0-24：需求萎缩或技术路线明显落后，行业长期承压
-
-置信度评分参考：
-- 高（75-100）：业务描述清晰，行业与技术趋势判断依据充分，关键变量少
-- 中（45-74）：信息基本可用，但存在若干关键不确定性
-- 低（0-44）：信息严重不足，或结果高度依赖难以预判的单一变量"""
+- 景气低迷 0-24：需求萎缩或技术路线明显落后，行业长期承压"""
 
 
 # ============================================================
@@ -187,7 +161,6 @@ USER_PROMPT_TEMPLATE = """请以 {as_of_date} 的视角，评估以下上市公�
 # ============================================================
 
 def _to_int(value, default: int = 0) -> int:
-    """尽力把 LLM 返回的分数转成整数。"""
     try:
         return int(round(float(value)))
     except (TypeError, ValueError):
@@ -195,7 +168,6 @@ def _to_int(value, default: int = 0) -> int:
 
 
 def _level_from_score(score: int) -> str:
-    """根据总分推导景气等级，保证等级与分数一致。"""
     if score >= 80:
         return "高景气"
     if score >= 65:
@@ -207,17 +179,7 @@ def _level_from_score(score: int) -> str:
     return "景气低迷"
 
 
-def _confidence_level_from_score(score: int) -> str:
-    """根据置信度分数推导置信度等级，保证等级与分数一致。"""
-    if score >= 75:
-        return "高"
-    if score >= 45:
-        return "中"
-    return "低"
-
-
 def _extract_json(raw_text: str) -> str:
-    """从模型输出中提取 JSON 主体，兼容代码块与前后废话。"""
     text = (raw_text or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
@@ -233,7 +195,7 @@ def _extract_json(raw_text: str) -> str:
 # ============================================================
 
 def evaluate_prosperity(
-    company_name: str,
+    company_code: str,
     business_description: str,
     extra_info: str = "",
     as_of_date: str = AS_OF_DATE,
@@ -243,11 +205,20 @@ def evaluate_prosperity(
     """
     调用 LLM 评估单家公司主营业务在未来五年的景气度预期。
 
-    返回结构化 dict，包含总分、等级、趋势、置信度、各维度理由、
+    参数
+    ----
+    company_code : str
+        公司代码（如 "600519"、"000001"）
+    business_description : str
+        主营业务描述
+    extra_info : str
+        补充信息（可选）
+
+    返回结构化 dict，包含总分、等级、趋势、各维度理由、
     驱动因素、风险与不确定性说明。
     """
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        company_name=company_name,
+        company_code=company_code,
         business_description=business_description,
         extra_info=extra_info or "（无）",
         as_of_date=as_of_date,
@@ -265,7 +236,7 @@ def evaluate_prosperity(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,        # 略高温度，允许对趋势做合理外推
+                temperature=0.2,
                 max_tokens=3000,
                 stream=False,
             )
@@ -282,14 +253,13 @@ def evaluate_prosperity(
             for key, max_score in DIMENSION_MAX.items():
                 dim = dims.get(key) or {}
                 score = _to_int(dim.get("score", 0), default=0)
-                score = max(0, min(score, max_score))   # 截断到合法区间
+                score = max(0, min(score, max_score))
                 dim["score"] = score
                 dims[key] = dim
                 dim_sum += score
             result["dimensions"] = dims
 
             total = _to_int(result.get("total_score", dim_sum), default=dim_sum)
-            # 与维度之和偏差超过 5 分，则以维度之和为准
             if dim_sum > 0 and abs(dim_sum - total) > 5:
                 total = dim_sum
             total = max(0, min(total, 100))
@@ -298,16 +268,9 @@ def evaluate_prosperity(
             # ---------- 等级与分数保持一致 ----------
             result["prosperity_level"] = _level_from_score(total)
 
-            # ---------- 置信度处理 ----------
-            conf_score = _to_int(result.get("confidence_score", 50), default=50)
-            conf_score = max(0, min(conf_score, 100))
-            # 如果模型给出的等级与分数不一致，以分数反推等级
-            result["confidence_score"] = conf_score
-            result["confidence_level"] = _confidence_level_from_score(conf_score)
-
             # ---------- 字段兜底 ----------
+            result["company_code"] = company_code      # 用入参覆盖，避免模型自造
             result.setdefault("trend", "持平")
-            result.setdefault("confidence_reason", "")
             result.setdefault("drivers", [])
             result.setdefault("risks", [])
             result.setdefault("uncertainty_notes", [])
@@ -320,24 +283,21 @@ def evaluate_prosperity(
 
         except json.JSONDecodeError as e:
             last_error = f"JSON 解析失败: {e}"
-            print(f"  [{company_name}] {last_error} (尝试 {attempt + 1}/{max_retries})")
+            print(f"  [{company_code}] {last_error} (尝试 {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)          # 指数退避
+                time.sleep(2 ** attempt)
 
         except Exception as e:  # noqa: BLE001
             last_error = f"API 调用失败: {e}"
-            print(f"  [{company_name}] {last_error} (尝试 {attempt + 1}/{max_retries})")
+            print(f"  [{company_code}] {last_error} (尝试 {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
 
     return {
-        "company_name": company_name,
+        "company_code": company_code,
         "total_score": None,
         "prosperity_level": "评估失败",
         "trend": None,
-        "confidence_level": None,
-        "confidence_score": None,
-        "confidence_reason": "",
         "drivers": [],
         "risks": [],
         "uncertainty_notes": [],
@@ -363,7 +323,7 @@ def batch_evaluate(
     参数
     ----
     companies : list[dict]
-        每项格式：{"name": "公司名称", "business": "主营业务描述", "extra": "补充信息（可选）"}
+        每项格式：{"code": "公司代码", "description": "主营业务描述", "extra": "补充信息（可选）"}
     as_of_date : str
         评估基准日期，默认 2021-01-01
     outlook_window : str
@@ -381,33 +341,30 @@ def batch_evaluate(
         future_map = {
             executor.submit(
                 evaluate_prosperity,
-                c["name"],
-                c["business"],
+                c["code"],
+                c["description"],
                 c.get("extra", ""),
                 as_of_date,
                 outlook_window,
-            ): c["name"]
+            ): c["code"]
             for c in companies
         }
 
         for future in as_completed(future_map):
-            name = future_map[future]
+            code = future_map[future]
             try:
                 result = future.result()
                 results.append(result)
                 score = result.get("total_score", "N/A")
                 level = result.get("prosperity_level", "N/A")
                 trend = result.get("trend") or "-"
-                conf = result.get("confidence_level") or "-"
-                print(f"  ✓ {name}: {score} 分 | {level} | 趋势 {trend} | 置信度 {conf}")
+                print(f"  ✓ {code}: {score} 分 | {level} | 趋势 {trend}")
             except Exception as e:  # noqa: BLE001
-                print(f"  ✗ {name}: 异常 - {e}")
+                print(f"  ✗ {code}: 异常 - {e}")
                 results.append({
-                    "company_name": name,
+                    "company_code": code,
                     "total_score": None,
                     "prosperity_level": "评估失败",
-                    "confidence_level": None,
-                    "confidence_score": None,
                     "_status": "failed",
                     "_error": str(e),
                 })
@@ -471,7 +428,7 @@ if __name__ == "__main__":
     print("-" * 70)
 
     single_result = evaluate_prosperity(
-        company_name="XX光模块股份有限公司",
+        company_code="XX001",
         business_description=(
             "公司主营高速光模块的研发、生产与销售，产品覆盖 100G/200G/400G 系列，"
             "下游客户以海外云计算厂商和国内通信设备商为主。公司持续投入硅光技术研发，"
@@ -490,36 +447,36 @@ if __name__ == "__main__":
     #   df_input = pd.read_csv("companies.csv")
     #   companies_to_evaluate = [
     #       {
-    #           "name": row["公司名称"],
-    #           "business": row["主营业务描述"],
+    #           "code": row["公司代码"],
+    #           "description": row["主营业务描述"],
     #           "extra": row.get("补充信息", ""),
     #       }
     #       for _, row in df_input.iterrows()
     #   ]
     companies_to_evaluate = [
         {
-            "name": "A公司",
-            "business": "公司专注于数据中心服务器整机的研发制造，并为客户提供定制化方案，客户以互联网与政企客户为主。",
+            "code": "A001",
+            "description": "公司专注于数据中心服务器整机的研发制造，并为客户提供定制化方案，客户以互联网与政企客户为主。",
             "extra": "公司在液冷散热方向有前期技术储备。",
         },
         {
-            "name": "B公司",
-            "business": "公司主营光伏硅料与硅片的生产与销售，产能规模位居行业前列。",
+            "code": "B001",
+            "description": "公司主营光伏硅料与硅片的生产与销售，产能规模位居行业前列。",
             "extra": "公司所在环节扩产周期较长，资本开支强度较高。",
         },
         {
-            "name": "C公司",
-            "business": "公司从事创新药研发，聚焦肿瘤免疫治疗领域的单克隆抗体和细胞疗法，拥有多个临床阶段管线。",
+            "code": "C001",
+            "description": "公司从事创新药研发，聚焦肿瘤免疫治疗领域的单克隆抗体和细胞疗法，拥有多个临床阶段管线。",
             "extra": "核心管线处于临床中后期，尚无商业化产品收入。",
         },
         {
-            "name": "D公司",
-            "business": "公司主营船舶制造，涵盖集装箱船、油轮及气体运输船，手持订单以海外船东为主。",
+            "code": "D001",
+            "description": "公司主营船舶制造，涵盖集装箱船、油轮及气体运输船，手持订单以海外船东为主。",
             "extra": "造船行业属于典型的长周期、重资产行业。",
         },
         {
-            "name": "E公司",
-            "business": "公司主要从事房地产开发与销售，兼营物业管理服务。",
+            "code": "E001",
+            "description": "公司主要从事房地产开发与销售，兼营物业管理服务。",
             "extra": "主要布局三四线城市。",
         },
     ]
@@ -532,8 +489,8 @@ if __name__ == "__main__":
     print("-" * 70)
 
     display_cols = [
-        "company_name", "total_score", "prosperity_level",
-        "trend", "confidence_level", "confidence_score",
+        "company_code", "total_score", "prosperity_level",
+        "trend",
     ]
     available_cols = [c for c in display_cols if c in df_result.columns]
     print(df_result[available_cols].to_string(index=False))
@@ -548,7 +505,6 @@ if __name__ == "__main__":
         )
         print("\n完整结果已保存至 prosperity_results.csv")
 
-        # 按景气度阈值筛选
         strong = output_df[
             output_df["total_score"].notna()
             & (output_df["total_score"] >= PROSPERITY_SCREEN_THRESHOLD)
@@ -564,22 +520,6 @@ if __name__ == "__main__":
                 "已保存至 prosperity_strong.csv"
             )
 
-        # 低置信度标记，提示人工复核
-        low_conf = output_df[
-            output_df["confidence_score"].notna()
-            & (output_df["confidence_score"] < CONFIDENCE_REVIEW_THRESHOLD)
-        ]
-        if not low_conf.empty:
-            low_conf[available_cols].to_csv(
-                "prosperity_low_confidence.csv",
-                index=False,
-                encoding="utf-8-sig",
-            )
-            print(
-                f"其中 {len(low_conf)} 家公司置信度 < {CONFIDENCE_REVIEW_THRESHOLD}，"
-                "建议人工复核，已保存至 prosperity_low_confidence.csv"
-            )
-
     # ---------- 6.5 快速统计 ----------
     print("\n" + "-" * 70)
     print("景气等级分布统计")
@@ -587,13 +527,7 @@ if __name__ == "__main__":
     if "prosperity_level" in df_result.columns:
         print(df_result["prosperity_level"].value_counts().to_string())
 
-    print("\n" + "-" * 70)
-    print("置信度分布统计")
-    print("-" * 70)
-    if "confidence_level" in df_result.columns:
-        print(df_result["confidence_level"].value_counts().to_string())
-
     if "total_score" in df_result.columns:
         print("\n平均景气度得分：", round(df_result["total_score"].mean(skipna=True), 2))
-    if "confidence_score" in df_result.columns:
-        print("平均置信度得分：", round(df_result["confidence_score"].mean(skipna=True), 2))
+
+        
