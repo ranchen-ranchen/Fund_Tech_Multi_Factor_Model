@@ -166,14 +166,38 @@ def match_business_description(path_hs300, path_business_des, date, code_col='co
     return result
 
 
-def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv', path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
+def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv', 
+    path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
     import sys
     from pathlib import Path
     project_root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(project_root))
-    result = match_business_description(path_hs300 = path_stock, path_business_des = path_description, date = query_date).to_dict(orient="records")
-    from strategy.eval_business_prosperity import batch_evaluate, flatten_results
-    df_result = batch_evaluate(result)
+    from strategy.eval_business_prosperity import evaluate_prosperity
+    df_des = read_business_description(path_description)
+    df_tmp = read_hs300_constituents(path_stock)
+    df_code = df_tmp[df_tmp['query_date'] == query_date]
+    def eval_pros(row, df_des):
+        result = evaluate_prosperity(company_code=row['code'], description=df_des.loc[df_des['code']== row['code'], 'description'].item())
+        if result['_status'] == 'success':
+                return result
+        max_retries = 10
+        attempt = 0
+        while result['_status'] == 'failed' and attempt < max_retries:
+            result = evaluate_prosperity(company_code=row['code'], description=df_des.loc[df_des['code']== row['code'], 'description'].item())
+            attempt += 1
+            if result['_status'] == 'success':
+                return result
+    
+    result = df_code.apply(eval_pros, axis=1, args=(df_des, ))
+    result = result.tolist()
+    df_result = pd.DataFrame(result)
+    if "total_score" in df_result.columns:
+        df_result = df_result.sort_values(
+            "total_score", ascending=False, na_position="last"
+        ).reset_index(drop=True)
+
+    from strategy.eval_business_prosperity import flatten_results
+
     print("\n" + "-" * 70)
     print("景气度评估结果汇总")
     print("-" * 70)
@@ -261,6 +285,46 @@ def fund_screen_policy_match(path_stock = 'data/hs300_constituents_2021_2026.csv
     if "match_level" in df_result.columns:
         print(df_result["match_level"].value_counts().to_string())
 
+
+
+def read_screened_company_codes(
+    file1: str ,
+    file2: str ,
+    limit: int = 200
+) -> list[str]:
+    import csv
+    from itertools import islice
+    """
+    分别读取两个 CSV 文件前 limit 条数据行中的 company_code，
+    返回两个文件中 company_code 重叠的部分。
+
+    注意：
+    - 使用 utf-8-sig 兼容 CSV 文件可能的 BOM 头。
+    - csv.DictReader 会自动把第一行当作表头，因此 limit=200 表示读取前 200 条数据行。
+    - 返回结果按 file1 中 company_code 出现的顺序排列，并去重。
+    """
+
+    def read_company_codes(path: str) -> list[str]:
+        codes = []
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in islice(reader, limit):
+                code = (row.get("company_code") or "").strip()
+                if code:
+                    codes.append(code)
+        return codes
+
+    codes1 = read_company_codes(file1)
+    codes2_set = set(read_company_codes(file2))
+
+    result = []
+    seen = set()
+    for code in codes1:
+        if code in codes2_set and code not in seen:
+            result.append(code)
+            seen.add(code)
+
+    return result
 
 
 
