@@ -166,7 +166,7 @@ def match_business_description(path_hs300, path_business_des, date, code_col='co
     return result
 
 
-def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv', 
+def fund_screen_prosperity_iterations(path_stock = 'data/hs300_constituents_2021_2026.csv', 
     path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
     import sys
     from pathlib import Path
@@ -224,6 +224,52 @@ def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv',
 
     if "total_score" in df_result.columns:
         print("\n平均景气度得分：", round(df_result["total_score"].mean(skipna=True), 2))
+
+
+
+
+
+def fund_screen_prosperity(path_stock = 'data/hs300_constituents_2021_2026.csv', path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):
+    import sys
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(project_root))
+    result = match_business_description(path_hs300 = path_stock, path_business_des = path_description, date = query_date).to_dict(orient="records")
+    from strategy.eval_business_prosperity import batch_evaluate_iterations
+    df_result = batch_evaluate_iterations(result, max_retries=5)
+
+    from strategy.eval_business_prosperity import flatten_results
+    print("\n" + "-" * 70)
+    print("景气度评估结果汇总")
+    print("-" * 70)
+    display_cols = [
+            "company_code", "total_score", "prosperity_level",
+            "trend",
+    ]
+    available_cols = [c for c in display_cols if c in df_result.columns]
+    print(df_result[available_cols].to_string(index=False))
+    if not df_result.empty:
+        output_df = flatten_results(df_result)
+        output_df.to_csv(
+                "prosperity_results.csv",
+                index=False,
+                encoding="utf-8-sig",
+        )
+        print("\n完整结果已保存至 prosperity_results.csv")
+
+    print("\n" + "-" * 70)
+    print("景气等级分布统计")
+    print("-" * 70)
+    if "prosperity_level" in df_result.columns:
+        print(df_result["prosperity_level"].value_counts().to_string())
+
+    if "total_score" in df_result.columns:
+        print("\n平均景气度得分：", round(df_result["total_score"].mean(skipna=True), 2))
+
+
+
+
+
 
 
 def fund_screen_policy_match(path_stock = 'data/hs300_constituents_2021_2026.csv', path_description = 'data/stock_main_business/main_business.csv', query_date = '2021-01-01'):

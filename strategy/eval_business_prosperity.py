@@ -414,6 +414,128 @@ def batch_evaluate(
 
     return df
 
+## 增加循环评估
+def _is_failed_result(result: dict) -> bool:
+    """判断 evaluate_prosperity 的返回结果是否表示评估失败。"""
+    if not isinstance(result, dict):
+        return True
+    return (
+        result.get("_status") == "failed"
+        or result.get("prosperity_level") == "评估失败"
+    )
+
+
+def batch_evaluate_iterations(
+    companies: list[dict],
+    as_of: str = DEFAULT_AS_OF,
+    max_workers: int = MAX_WORKERS,
+    max_retries: int | None = None,
+) -> pd.DataFrame:
+    """
+    批量评估多家公司在指定时点的业务景气度预期。
+
+    参数
+    ----
+    companies : list[dict]
+        每项格式：{"code": "公司代码", "description": "主营业务描述",
+                   "extra": "可选补充信息"}
+    as_of : str
+        评估时点，默认 2021
+    max_workers : int
+        并发线程数
+    max_retries : int | None
+        失败后的最大额外重试轮数。
+        None 表示一直重试直到没有失败项，慎用，可能死循环。
+        0 表示不重试。
+        3 表示初次评估失败后，最多再重试 3 轮。
+
+    返回
+    ----
+    pd.DataFrame，按 total_score 降序排列
+    """
+    final_results: list[dict] = []
+    pending = list(companies)
+    attempt = 0
+
+    while pending:
+        attempt += 1
+        failed_items: list[tuple[dict, Exception]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    evaluate_prosperity,
+                    company["code"],
+                    company["description"],
+                    as_of,
+                    company.get("extra", ""),
+                ): company
+                for company in pending
+            }
+
+            for future in as_completed(future_map):
+                company = future_map[future]
+                code = company["code"]
+
+                try:
+                    result = future.result()
+
+                    # 不仅捕获异常，也识别返回结果中标记为失败的情况
+                    if _is_failed_result(result):
+                        if isinstance(result, dict):
+                            msg = result.get("_error", "评估结果标记为失败")
+                        else:
+                            msg = "评估结果不是字典"
+                        raise RuntimeError(msg)
+
+                    result["company_code"] = code
+                    final_results.append(result)
+
+                    score = result.get("total_score", "N/A")
+                    level = result.get("prosperity_level", "N/A")
+                    trend = result.get("trend", "N/A")
+                    print(f"  ✓ {code}: {score} 分 ({level} / {trend})")
+
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ✗ {code}: 第 {attempt} 轮评估失败 - {e}")
+                    failed_items.append((company, e))
+
+        # 没有失败项，结束
+        if not failed_items:
+            break
+
+        # 达到最大重试轮数，把仍然失败的公司写入最终结果
+        if max_retries is not None and attempt > max_retries:
+            for company, error in failed_items:
+                code = company["code"]
+                final_results.append({
+                    "company_code": code,
+                    "as_of": str(as_of),
+                    "total_score": None,
+                    "prosperity_level": "评估失败",
+                    "trend": "未知",
+                    "_status": "failed",
+                    "_attempts": attempt,
+                    "_error": str(error),
+                })
+            break
+
+        # 只重试本轮失败的公司
+        pending = [company for company, _ in failed_items]
+        print(f"  ↻ 第 {attempt} 轮结束，仍有 {len(pending)} 家公司失败，准备重试...")
+
+    df = pd.DataFrame(final_results)
+    if "total_score" in df.columns:
+        df = df.sort_values(
+            "total_score", ascending=False, na_position="last"
+        ).reset_index(drop=True)
+
+    return df
+
+
+
+
+
 
 def flatten_results(df: pd.DataFrame) -> pd.DataFrame:
     """把嵌套的 dimensions / 列表字段展开为扁平的 CSV 友好结构。"""
@@ -515,7 +637,7 @@ if __name__ == "__main__":
         },
     ]
 
-    df_result = batch_evaluate(companies_to_evaluate, as_of=AS_OF)
+    df_result = batch_evaluate_iterations(companies_to_evaluate, as_of=AS_OF)
 
     # ---------- 7.3 输出结果 ----------
     print("\n" + "=" * 60)
