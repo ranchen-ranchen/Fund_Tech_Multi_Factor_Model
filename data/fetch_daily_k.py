@@ -2,13 +2,19 @@
 fetch_daily_k.py
 基于 baostock 批量获取 A 股日 K 线数据（前复权）
 
+特性：
+    - 断点续传：以 out_dir/individual/*.csv 作为缓存，重启自动跳过已抓取标的
+    - 单只股票失败重试
+    - 结果汇总为 all_daily_k.csv / all_daily_k.parquet
+
 依赖:
     pip install baostock pandas
+    # 可选：pip install pyarrow   （保存 parquet 用）
 
 输出:
-    data/all_daily_k.csv          # 所有股票合并后的长表
-    data/all_daily_k.parquet      # 同上（需要 pyarrow / fastparquet）
-    data/individual/sh.600519.csv # 每只股票单独一份（可选）
+    stock_daily_k/all_daily_k.csv          # 所有股票合并后的长表
+    stock_daily_k/all_daily_k.parquet      # 同上（需要 pyarrow / fastparquet）
+    stock_daily_k/individual/sh_600519.csv # 每只股票单独一份（同时作为缓存）
 """
 
 from __future__ import annotations
@@ -21,7 +27,6 @@ import pandas as pd
 import baostock as bs
 
 # ============================ 配置区 ============================
-# 股票代码列表：支持 '600519'、'sh.600519'、'SH600519'、'600519.SH' 等写法
 STOCK_CODES: List[str] = [
     "600519",          # 贵州茅台
     "000001",          # 平安银行
@@ -34,15 +39,15 @@ START_DATE = "2021-01-01"
 END_DATE = "2026-01-01"
 
 FREQUENCY = "d"        # d=日线, w=周线, m=月线
-ADJUST_FLAG = "1"      # 1=后复权, 2=前复权, 3=不复权  ← 前复权
+ADJUST_FLAG = "1"      # 1=后复权, 2=前复权, 3=不复权
 
 OUT_DIR = "stock_daily_k"
-SAVE_INDIVIDUAL = True   # 是否额外保存每只股票单独的 csv
+SAVE_INDIVIDUAL = True   # 是否额外保存每只股票单独的 csv（断点续传依赖它）
+RESUME = True            # ★ 断点续传开关
 MAX_RETRY = 3            # 单只股票失败重试次数
 RETRY_SLEEP = 1.5        # 重试间隔基数（秒）
 # ===============================================================
 
-# baostock 日线可用字段
 FIELDS = (
     "date,code,open,high,low,close,preclose,"
     "volume,amount,turn,pctChg,tradestatus,isST"
@@ -52,7 +57,6 @@ FLOAT_COLS = ["open", "high", "low", "close", "preclose",
               "volume", "amount", "turn", "pctChg"]
 INT_COLS = ["tradestatus", "isST"]
 
-# 输出列顺序
 OUT_COLS = ["date", "code", "open", "high", "low", "close", "preclose",
             "volume", "amount", "turn", "pctChg", "tradestatus", "isST"]
 
@@ -68,7 +72,6 @@ def normalize_code(code: str) -> str:
     if not raw:
         raise ValueError("股票代码为空")
 
-    # 形如 sh.600000 或 600000.sh
     if "." in raw:
         parts = raw.split(".")
         if len(parts) != 2:
@@ -80,7 +83,6 @@ def normalize_code(code: str) -> str:
             return f"{b}.{a}"
         raise ValueError(f"无法识别的股票代码: {code}")
 
-    # 形如 sh600000 / sz000001
     for pre in ("sh", "sz", "bj"):
         if raw.startswith(pre) and raw[2:].isdigit():
             return f"{pre}.{raw[2:]}"
@@ -88,7 +90,6 @@ def normalize_code(code: str) -> str:
     if not raw.isdigit():
         raise ValueError(f"无法识别的股票代码: {code}")
 
-    # 纯数字：按前缀推断交易所
     if raw.startswith(("60", "68", "51", "58", "11", "90", "50")):
         return f"sh.{raw}"
     if raw.startswith(("00", "30", "12", "15", "16", "18", "20", "39", "13")):
@@ -96,7 +97,6 @@ def normalize_code(code: str) -> str:
     if raw.startswith(("43", "83", "87", "88", "92")):
         return f"bj.{raw}"
 
-    # 兜底
     return f"sh.{raw}" if raw[0] in ("5", "6", "9") else f"sz.{raw}"
 
 
@@ -119,6 +119,53 @@ def logout() -> None:
 
 
 # ----------------------------------------------------------------------
+# 缓存辅助
+# ----------------------------------------------------------------------
+def _individual_path(ind_dir: str, bs_code: str) -> str:
+    """个股 csv 路径（也用作缓存文件）。"""
+    return os.path.join(ind_dir, f"{bs_code.replace('.', '_')}.csv")
+
+
+def _load_cached(path: str) -> Optional[pd.DataFrame]:
+    """
+    尝试从缓存文件加载数据。
+    - 文件不存在 / 空 / 解析失败 → 返回 None
+    - 成功 → 返回规范化后的 DataFrame
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 读取缓存失败 {path}: {e}")
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # 类型规范化，保持与其他来源一致
+    for c in FLOAT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in INT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    if "date" not in df.columns:
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return None
+
+    # 补齐列顺序
+    for c in OUT_COLS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[OUT_COLS].reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------
 # 单只股票数据获取
 # ----------------------------------------------------------------------
 def fetch_one(bs_code: str,
@@ -127,10 +174,6 @@ def fetch_one(bs_code: str,
               frequency: str = FREQUENCY,
               adjustflag: str = ADJUST_FLAG,
               max_retry: int = MAX_RETRY) -> pd.DataFrame:
-    """
-    获取单只股票的日 K 数据，返回规范化后的 DataFrame（可能为空）。
-    带重试机制。
-    """
     last_err: Optional[Exception] = None
 
     for attempt in range(1, max_retry + 1):
@@ -167,13 +210,11 @@ def fetch_one(bs_code: str,
 
 
 def _clean(df: pd.DataFrame, bs_code: str) -> pd.DataFrame:
-    """类型转换 + 排序 + 去重"""
     if df is None or df.empty:
         return pd.DataFrame(columns=OUT_COLS)
 
     df = df.copy()
 
-    # 数值列转换（baostock 返回空字符串时 to_numeric 会得到 NaN）
     for c in FLOAT_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -181,11 +222,9 @@ def _clean(df: pd.DataFrame, bs_code: str) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # 日期列
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"])
 
-    # 剔除停牌日（tradestatus == 0）——如需保留停牌数据，注释掉下面两行
     if "tradestatus" in df.columns:
         df = df[df["tradestatus"] == 1]
 
@@ -193,7 +232,6 @@ def _clean(df: pd.DataFrame, bs_code: str) -> pd.DataFrame:
             .sort_values("date")
             .reset_index(drop=True))
 
-    # 补齐缺失列，统一列顺序
     for c in OUT_COLS:
         if c not in df.columns:
             df[c] = pd.NA
@@ -201,27 +239,41 @@ def _clean(df: pd.DataFrame, bs_code: str) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------
-# 批量获取
+# 批量获取（★ 支持断点续传）
 # ----------------------------------------------------------------------
 def get_daily_data(codes: List[str],
                    start_date: str = START_DATE,
                    end_date: str = END_DATE,
                    out_dir: str = OUT_DIR,
-                   save_individual: bool = SAVE_INDIVIDUAL) -> pd.DataFrame:
+                   save_individual: bool = SAVE_INDIVIDUAL,
+                   resume: bool = RESUME) -> pd.DataFrame:
     """
     批量获取日 K 数据，返回合并后的长表 DataFrame，并落盘。
+
+    断点续传逻辑：
+      - 若 resume=True 且 out_dir/individual/{code}.csv 已存在且非空，
+        则直接加载缓存、跳过网络请求；
+      - 抓取成功的标的会立即写入 individual csv，供后续运行复用；
+      - 因此中断后重新运行此函数即可"接着上一次的进度继续"。
     """
     if not codes:
         raise ValueError("股票代码列表为空")
 
     os.makedirs(out_dir, exist_ok=True)
     ind_dir = os.path.join(out_dir, "individual")
+
+    # 断点续传依赖个股缓存文件 → 开启续传时强制保存 individual
+    if resume and not save_individual:
+        print("[INFO] 断点续传需要个股文件作为缓存，已自动开启 save_individual")
+        save_individual = True
     if save_individual:
         os.makedirs(ind_dir, exist_ok=True)
 
     login()
     frames: List[pd.DataFrame] = []
     failed: List[str] = []
+    cache_hits: List[str] = []
+    fetched: List[str] = []
 
     try:
         total = len(codes)
@@ -233,7 +285,20 @@ def get_daily_data(codes: List[str],
                 failed.append(str(raw_code))
                 continue
 
-            print(f"[{i}/{total}] 获取 {bs_code} ...", end=" ", flush=True)
+            fname = _individual_path(ind_dir, bs_code)
+
+            # ---------- ① 断点续传：优先命中缓存 ----------
+            if resume:
+                cached = _load_cached(fname)
+                if cached is not None:
+                    print(f"[{i}/{total}] [cache] {bs_code}  命中缓存，{len(cached)} 条 "
+                          f"({cached['date'].iloc[0].date()} ~ {cached['date'].iloc[-1].date()})")
+                    frames.append(cached)
+                    cache_hits.append(bs_code)
+                    continue
+
+            # ---------- ② 走网络抓取 ----------
+            print(f"[{i}/{total}] [fetch] {bs_code} ...", end=" ", flush=True)
             try:
                 df = fetch_one(bs_code, start_date, end_date)
             except Exception as e:  # noqa: BLE001
@@ -248,15 +313,22 @@ def get_daily_data(codes: List[str],
 
             print(f"{len(df)} 条  {df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()}")
             frames.append(df)
+            fetched.append(bs_code)
 
+            # ---------- ③ 立即落盘，作为下次运行的缓存 ----------
             if save_individual:
-                fname = os.path.join(ind_dir, f"{bs_code.replace('.', '_')}.csv")
-                df.to_csv(fname, index=False, encoding="utf-8-sig")
+                try:
+                    df.to_csv(fname, index=False, encoding="utf-8-sig")
+                except Exception as e:  # noqa: BLE001
+                    print(f"    [WARN] 写入缓存失败 {fname}: {e}")
 
-            time.sleep(0.05)  # 轻微限速，避免请求过密
+            time.sleep(0.05)  # 轻微限速
 
     finally:
         logout()
+
+    # ---------- 汇总 ----------
+    print(f"\n[INFO] 抓取 {len(fetched)} 只，缓存命中 {len(cache_hits)} 只，失败 {len(failed)} 只")
 
     if not frames:
         print("[WARN] 未获取到任何数据")
@@ -266,7 +338,6 @@ def get_daily_data(codes: List[str],
                 .sort_values(["code", "date"])
                 .reset_index(drop=True))
 
-    # 落盘：合并表
     csv_path = os.path.join(out_dir, "all_daily_k.csv")
     all_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"[INFO] 合并数据已保存: {csv_path}  形状={all_df.shape}")
@@ -294,6 +365,7 @@ if __name__ == "__main__":
         end_date=END_DATE,
         out_dir=OUT_DIR,
         save_individual=SAVE_INDIVIDUAL,
+        resume=RESUME,
     )
 
     if not data.empty:
@@ -303,3 +375,5 @@ if __name__ == "__main__":
         print(data.groupby("code").size().to_string())
         print("\n字段类型：")
         print(data.dtypes.to_string())
+
+
