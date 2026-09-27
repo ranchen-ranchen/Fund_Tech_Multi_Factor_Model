@@ -1,0 +1,34 @@
+{
+  "base_risk_pct": 0.015,
+  "max_position_pct": 0.25,
+  "lot_size": 100,
+  "atr_period": 14,
+  "init_atr_mult": 2.5,
+  "tech_stop_buffer": 0.005,
+  "trail_atr_mult": 4.0,
+  "trail_activate_R": 1.5,
+  "hard_max_loss_pct": 0.08,
+  "min_stop_atr": 0.5,
+  "tp_levels": [
+    [
+      2.0,
+      0.2
+    ],
+    [
+      4.0,
+      0.3
+    ]
+  ],
+  "exit_on_big_reverse": true,
+  "exit_on_small_reverse": false,
+  "big_reverse_threshold": -2,
+  "small_reverse_threshold": -3,
+  "cooldown_bars": 5,
+  "slippage": 0.0005,
+  "commission": 0.0003,
+  "top_n": 5,
+  "min_mult": 0.08,
+  "cash_buffer": 0.98,
+  "exit_on_dropout": false,
+  "log_position_daily": false
+}

@@ -104,34 +104,38 @@ def test_signal_multiplier():
     row_mid_adx  = row.copy(); row_mid_adx["ADX"] = 25;  row_mid_adx["BREAK_SCORE"] = 0
     assert signal_multiplier(row_low_adx) < signal_multiplier(row_mid_adx)
 
-
 def test_initial_and_effective_stop():
     cfg = PositionConfig()
     entry, atr, support = 100.0, 2.0, 96.0
     s_init, s_hard, s_tech = compute_initial_stops(entry, atr, support, cfg)
-    assert abs(s_init - 96.0) < 1e-9
+    # init_atr_mult 默认改为 2.5 → s_init = 100 - 2.5*2 = 95.0
+    assert abs(s_init - 95.0) < 1e-9
     assert abs(s_hard - 92.0) < 1e-9
     assert s_tech is not None and abs(s_tech - 95.52) < 1e-9
 
     stop = effective_stop(entry, atr, s_init, s_hard, s_tech, None, cfg)
-    assert abs(stop - 96.0) < 1e-9
+    # 候选 max(95.0, 92.0, 95.52) = 95.52，受 floor=99.0 约束后仍为 95.52
+    assert abs(stop - 95.52) < 1e-9
     assert stop < entry
 
     s_init2, s_hard2, s_tech2 = compute_initial_stops(entry, atr, np.nan, cfg)
     stop2 = effective_stop(entry, atr, s_init2, s_hard2, s_tech2, None, cfg)
-    assert abs(stop2 - 96.0) < 1e-9
-
+    # 无技术止损时 max(95.0, 92.0) = 95.0
+    assert abs(stop2 - 95.0) < 1e-9
 
 def test_position_size():
     cfg = PositionConfig()
     equity, entry, stop, mult = 1_000_000.0, 100.0, 96.0, 1.0
     shares, r, budget = compute_position_size(equity, entry, stop, mult, cfg)
     assert r == 4.0
-    assert abs(budget - 10_000.0) < 1e-9
-    assert shares == 2200
+    # base_risk_pct 默认改为 0.015 → budget = 1_000_000 * 0.015 = 15_000
+    assert abs(budget - 15_000.0) < 1e-9
+    # 风险预算对应 3750 股，但 max_position_pct=0.25 → 上限 2500 股
+    assert shares == 2500
 
     assert compute_position_size(equity, entry, stop, 0.0, cfg)[0] == 0
     assert compute_position_size(equity, 100.0, 100.0, 1.0, cfg)[0] == 0
+    
 
 
 def test_position_dataclass():

@@ -1,9 +1,15 @@
-
+# multi_stock_cross_section.py
 from __future__ import annotations
+
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Tuple, Dict
 
 
@@ -18,38 +24,90 @@ def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
         (high - close.shift()).abs(),
         (low - close.shift()).abs(),
     ], axis=1).max(axis=1)
-    # Wilder 平滑，与 ADX 中用的 ATR 保持一致
     df["ATR"] = tr.ewm(alpha=1.0 / period, adjust=False).mean()
     df["ATR_PCT"] = df["ATR"] / df["close"] * 100
     return df
 
 
 # ============================================================
-# 1. 配置：所有可调参数集中在这里
+# 0'. 日志基础设施
+# ============================================================
+def _setup_logger(log_dir: Path) -> logging.Logger:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("pool_bt")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    fh = RotatingFileHandler(
+        log_dir / "run.log", maxBytes=20 * 1024 * 1024,
+        backupCount=5, encoding="utf-8",
+    )
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+class EventRecorder:
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh = open(path, "w", encoding="utf-8")
+
+    def log(self, event: str, **kw):
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            **kw,
+        }
+        self._fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        self._fh.flush()
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# 1. 配置
 # ============================================================
 @dataclass
 class PositionConfig:
     # ---------- 风险预算 ----------
-    base_risk_pct: float = 0.010          # 单笔基础风险 = 权益 × 1%
-    max_position_pct: float = 0.22        # 单票最大仓位占比
-    lot_size: int = 100                   # A 股一手 = 100 股
+    base_risk_pct: float = 0.02          # 提高风险预算
+    max_position_pct: float = 0.20       # 降低单票最大仓位
+    lot_size: int = 100
 
     # ---------- ATR ----------
     atr_period: int = 14
 
     # ---------- 分层止损 ----------
-    init_atr_mult: float = 2.0            # 初始止损 = entry − 2·ATR
-    tech_stop_buffer: float = 0.005       # 技术止损缓冲：支撑下方 0.5%
-    trail_atr_mult: float = 3.0           # 移动止损 = high_water − 3·ATR
-    trail_activate_R: float = 1.0         # 浮盈 ≥ 1R 后才启用移动止损
-    hard_max_loss_pct: float = 0.08       # 硬性最大亏损 8%
-    min_stop_atr: float = 0.5             # 有效止损至少离入场 0.5·ATR
+    init_atr_mult: float = 2.0           # 降低初始止损
+    tech_stop_buffer: float = 0.005
+    trail_atr_mult: float = 2.5          # 移动止损更紧
+    trail_activate_R: float = 2.0        # 更早激活移动止损
+    hard_max_loss_pct: float = 0.06      # 硬止损更紧
+    min_stop_atr: float = 0.5
 
-    # ---------- 分批止盈：(R 倍数, 卖出比例) ----------
+    # ---------- 分批止盈 ----------
     tp_levels: Tuple[Tuple[float, float], ...] = (
-        (1.5, 0.30),
-        (2.5, 0.30),
-        (4.0, 0.40),
+        (1.5, 0.33),
+        (3.0, 0.33),
     )
 
     # ---------- 趋势反转清仓 ----------
@@ -59,25 +117,28 @@ class PositionConfig:
     small_reverse_threshold: int = -3
 
     # ---------- 冷却期 ----------
-    cooldown_bars: int = 5
+    cooldown_bars: int = 10              # 延长冷却期
 
     # ---------- 回测摩擦 ----------
-    slippage: float = 0.0005              # 单边 0.05%
-    commission: float = 0.0003            # 单边 0.03%
+    slippage: float = 0.0005
+    commission: float = 0.0003
 
-    # ---------- 新增：池化参数 ----------
-    top_n: int = 5                 # 最大同时持仓数
-    min_mult: float = 0.05         # 入场打分下限（避免垃圾票进池）
-    cash_buffer: float = 0.98      # 单票建仓时最多动用现金比例
-    exit_on_dropout: bool = False   # 掉出 top_n 是否强平（默认 False 更温和）
+    # ---------- 池化参数 ----------
+    top_n: int = 5
+    min_mult: float = 0.30               # 大幅提高开仓门槛
+    cash_buffer: float = 0.98
+    exit_on_dropout: bool = True         # 开启排名掉队清仓
+    dropout_buffer: int = 2              # 排名跌出 top_n * buffer 才清仓
+    max_new_positions_per_day: int = 2   # 每天最多开仓数量
 
+    # ---------- 日志 ----------
+    log_position_daily: bool = False
 
 
 # ============================================================
 # 2. 信号 → 仓位乘数
 # ============================================================
 def _trend_state(score: float) -> int:
-    """±4 的分数 → 向上/中性/向下"""
     if pd.isna(score):
         return 0
     if score >= 2:
@@ -87,49 +148,36 @@ def _trend_state(score: float) -> int:
     return 0
 
 
-# 九宫格基础乘数（与上游 DECISION_MAP 语义一致）
 _STATE_MULT: Dict[Tuple[int, int], float] = {
-    ( 1,  1): 1.00,   # 主升浪
-    ( 1,  0): 0.70,   # 上升途中整理
-    ( 1, -1): 0.30,   # 上升趋势中的回调
-    ( 0,  1): 0.40,   # 震荡反弹
-    ( 0,  0): 0.20,   # 横盘
-    ( 0, -1): 0.00,   # 震荡转弱
-    (-1,  1): 0.10,   # 下跌趋势中的反弹（只做试探）
-    (-1,  0): 0.00,   # 弱势整理
-    (-1, -1): 0.00,   # 空头排列
+    ( 1,  1): 1.00,
+    ( 1,  0): 0.70,
+    ( 1, -1): 0.30,
+    ( 0,  1): 0.40,
+    ( 0,  0): 0.20,
+    ( 0, -1): 0.00,
+    (-1,  1): 0.10,
+    (-1,  0): 0.00,
+    (-1, -1): 0.00,
 }
 
 
 def signal_multiplier(row: pd.Series) -> float:
     """
-    将技术信号压缩为 [0, 1.5] 的仓位乘数。
-
-    调节因子：
-      · 九宫格基础乘数
-      · ADX 趋势强度调节（无趋势降仓位）
-      · TREND_HEALTH 量价健康度调节
-      · BREAK_SCORE 放量突破加分
-      · TOP_WARN 顶部预警强制减仓
-      · BOTTOM_WARN 底部预警可小仓试多
+    使用平滑后的趋势分数，并增加硬性过滤。
     """
-    big = float(row.get("BIG_SCORE", 0) or 0)
-    small = float(row.get("SMALL_SCORE", 0) or 0)
+    big = float(row.get("BIG_SCORE_SMOOTH", 0) or 0)
+    small = float(row.get("SMALL_SCORE_SMOOTH", 0) or 0)
+
+    # 硬性条件：大趋势必须 >= 2 且小趋势 >= 0，或大趋势 >= 0 且小趋势 >= 2
+    if not ((big >= 2 and small >= 0) or (big >= 0 and small >= 2)):
+        return 0.0
 
     mult = _STATE_MULT.get((_trend_state(big), _trend_state(small)), 0.0)
     if mult <= 0:
         return 0.0
 
-    # ---- ADX 趋势强度调节 ----
-    adx = row.get("ADX", np.nan)
-    if pd.isna(adx) or adx < 15:
-        mult *= 0.50
-    elif adx < 20:
-        mult *= 0.80
-    elif adx >= 30:
-        mult *= 1.10
-
-    # ---- 量价健康度 ----
+    # ADX 已在 tech_analysis 中做过 gate，这里不再重复惩罚
+    # 仅保留趋势健康度和突破的微调
     health = row.get("TREND_HEALTH", np.nan)
     if not pd.isna(health):
         if health >= 40:
@@ -137,11 +185,9 @@ def signal_multiplier(row: pd.Series) -> float:
         elif health <= -40:
             mult *= 0.60
 
-    # ---- 放量突破加分 ----
     if int(row.get("BREAK_SCORE", 0) or 0) >= 2:
         mult *= 1.15
 
-    # ---- 顶部/底部预警 ----
     if bool(row.get("TOP_WARN", False)):
         mult *= 0.40
     if bool(row.get("BOTTOM_WARN", False)):
@@ -155,13 +201,6 @@ def signal_multiplier(row: pd.Series) -> float:
 # ============================================================
 def compute_initial_stops(entry: float, atr: float, support: Optional[float],
                           cfg: PositionConfig):
-    """
-    返回 (s_init, s_hard, s_tech) —— 各层独立价格。
-
-      s_init = entry − init_atr_mult · ATR
-      s_hard = entry · (1 − hard_max_loss_pct)      ← 绝对下限
-      s_tech = support · (1 − tech_stop_buffer)     ← 若有效支撑存在
-    """
     s_init = entry - cfg.init_atr_mult * atr
     s_hard = entry * (1.0 - cfg.hard_max_loss_pct)
 
@@ -175,12 +214,6 @@ def compute_initial_stops(entry: float, atr: float, support: Optional[float],
 def effective_stop(entry: float, atr: float, s_init: float, s_hard: float,
                    s_tech: Optional[float], s_trail: Optional[float],
                    cfg: PositionConfig) -> float:
-    """
-    有效止损 = max(各层生效价格)   —— 取最紧
-    再受两个约束：
-      ① 不得比 entry − min_stop_atr·ATR 更紧（防止被噪音扫损）
-      ② 不得低于 s_hard（硬性最大亏损兜底）
-    """
     cands = [s_init, s_hard]
     if s_tech is not None:
         cands.append(s_tech)
@@ -190,9 +223,9 @@ def effective_stop(entry: float, atr: float, s_init: float, s_hard: float,
     stop = max(cands)
 
     floor = entry - cfg.min_stop_atr * atr
-    stop = min(stop, floor)          # 不能太紧
-    stop = max(stop, s_hard)         # 不能太松
-    stop = min(stop, entry * 0.999)  # 必须低于入场价
+    stop = min(stop, floor)
+    stop = max(stop, s_hard)
+    stop = min(stop, entry * 0.999)
     return float(stop)
 
 
@@ -200,13 +233,8 @@ def effective_stop(entry: float, atr: float, s_init: float, s_hard: float,
 # 4. 风险预算法仓位
 # ============================================================
 def compute_position_size(equity: float, entry: float, stop: float,
-                          multiplier: float, cfg: PositionConfig) -> Tuple[int, float, float]:
-    """
-    返回 (shares, R_per_share, risk_budget)
-      R_per_share = entry − stop        每股风险
-      risk_budget = equity × base_risk_pct × multiplier
-      shares      = risk_budget / R_per_share     ← 再受 max_position_pct 约束
-    """
+                          multiplier: float, cfg: PositionConfig
+                          ) -> Tuple[int, float, float]:
     r = entry - stop
     if r <= 0 or multiplier <= 0:
         return 0, 0.0, 0.0
@@ -214,11 +242,9 @@ def compute_position_size(equity: float, entry: float, stop: float,
     risk_budget = equity * cfg.base_risk_pct * multiplier
     shares = risk_budget / r
 
-    # 单票仓位上限
     cap_shares = equity * cfg.max_position_pct / entry
     shares = min(shares, cap_shares)
 
-    # 整手
     shares = int(shares // cfg.lot_size) * cfg.lot_size
     return shares, float(r), float(risk_budget)
 
@@ -246,41 +272,72 @@ class Position:
     entry_mult: float = 0.0
     partial_exits: List[dict] = field(default_factory=list)
 
+    # -------- 复盘用 --------
+    entry_signal: dict = field(default_factory=dict)
+    entry_ctx: dict = field(default_factory=dict)
+    stop_history: List[dict] = field(default_factory=list)
+
+    # -------- 新增：准确计算平均出场价 --------
+    total_exit_amount: float = 0.0
+    total_exit_shares: float = 0.0
+
     def __post_init__(self):
         if self.high_water <= 0:
             self.high_water = self.entry_price
 
 
-
-
 # ============================================================
-# 6'. 池化回测主循环（横截面，共享每日排名）
+# 6. 池化回测主循环
 # ============================================================
 def backtest_pool(
     data_dict: Dict[str, pd.DataFrame],
     cfg: Optional[PositionConfig] = None,
     initial_equity: float = 1_000_000.0,
+    log_dir: Optional[str] = None,
+    market_df: Optional[pd.DataFrame] = None,   # 新增：大盘数据，用于市场过滤
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    股票池横截面回测。
-
-    每日流程：
-      (0) 全池打分一次 → 得到 ranked（已过滤冷却/低分/ATR无效）
-      (A) 遍历已有持仓 → 止损 / 止盈 / 反转 / dropout / 更新移动止损
-      (B) 用同一份 ranked 填补 top_n 空槽
-      (C) 记录组合净值（cash + Σ 市值）
-    """
     cfg = cfg or PositionConfig()
 
-    # ---------- 预处理：为每票补 ATR ----------
+    # ---------- 日志初始化 ----------
+    run_dir = Path(log_dir or "logs") / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger = _setup_logger(run_dir)
+    recorder = EventRecorder(run_dir / "events.jsonl")
+
+    (run_dir / "config.json").write_text(
+        json.dumps(asdict(cfg), indent=2, default=str, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(f"回测开始 | 初始权益={initial_equity:,.0f}")
+    logger.info(f"日志目录: {run_dir.resolve()}")
+
+    # ---------- 预处理 ----------
     prepared: Dict[str, pd.DataFrame] = {}
     for sym, df in data_dict.items():
         d = df.copy()
         if "ATR" not in d.columns:
             d = add_atr(d, cfg.atr_period)
+        # 确保有平滑分数
+        if "BIG_SCORE_SMOOTH" not in d.columns and "BIG_SCORE" in d.columns:
+            d["BIG_SCORE_SMOOTH"] = d["BIG_SCORE"].rolling(3, min_periods=1).mean()
+        if "SMALL_SCORE_SMOOTH" not in d.columns and "SMALL_SCORE" in d.columns:
+            d["SMALL_SCORE_SMOOTH"] = d["SMALL_SCORE"].rolling(3, min_periods=1).mean()
         prepared[sym] = d
 
-    # ---------- 所有交易日（并集，缺失日期在循环内自动跳过） ----------
+    # 大盘过滤准备
+    market_ok = {}
+    if market_df is not None and not market_df.empty:
+        m = market_df.copy()
+        m["MA60"] = m["close"].rolling(60).mean()
+        m["market_ok"] = (m["close"] > m["MA60"]) & (m["MA60"].diff() > 0)
+        for date, row in m.iterrows():
+            market_ok[date] = bool(row["market_ok"])
+    else:
+        # 如果没有大盘数据，默认始终允许交易
+        for df in prepared.values():
+            for date in df.index:
+                market_ok[date] = True
+
     all_dates = sorted(set().union(*[set(df.index) for df in prepared.values()]))
 
     # ---------- 组合状态 ----------
@@ -298,6 +355,12 @@ def backtest_pool(
         loc = df.index.get_loc(date)
         return loc.start if isinstance(loc, slice) else int(loc)
 
+    def _safe_float(v, default=np.nan):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
     def _exec_exit(sym: str, date, price: float, reason: str) -> None:
         nonlocal cash
         pos = positions.pop(sym)
@@ -306,7 +369,21 @@ def backtest_pool(
         cash += gross - fee
         pos.realized_pnl += (price - pos.entry_price) * pos.shares - fee
 
-        avg_exit = (pos.entry_price * pos.initial_shares + pos.realized_pnl) / pos.initial_shares
+        # 记录最终卖出
+        pos.total_exit_amount += gross
+        pos.total_exit_shares += pos.shares
+
+        avg_exit = (pos.total_exit_amount / pos.total_exit_shares
+                    if pos.total_exit_shares > 0 else pos.entry_price)
+
+        row = None
+        df_s = prepared[sym]
+        if date in df_s.index:
+            r = df_s.loc[date]
+            if isinstance(r, pd.DataFrame):
+                r = r.iloc[0]
+            row = r
+
         trades.append({
             "symbol": sym,
             "entry_date": pos.entry_date, "entry_price": pos.entry_price,
@@ -320,42 +397,129 @@ def backtest_pool(
             "entry_mult": pos.entry_mult,
             "r_per_share": pos.r_per_share,
             "tp_taken": len(pos.tp_taken),
+
+            **{f"in_{k}": v for k, v in pos.entry_signal.items()},
+            **{f"ctx_{k}": v for k, v in pos.entry_ctx.items()},
+
+            "exit_open": _safe_float(row["open"]) if row is not None else None,
+            "exit_high": _safe_float(row["high"]) if row is not None else None,
+            "exit_low": _safe_float(row["low"]) if row is not None else None,
+            "exit_close": _safe_float(row["close"]) if row is not None else None,
+            "exit_fee": fee,
+            "high_water": pos.high_water,
+
+            "stop_history": json.dumps(pos.stop_history, default=str,
+                                       ensure_ascii=False),
+            "partial_exits": json.dumps(pos.partial_exits, default=str,
+                                        ensure_ascii=False),
         })
+
+        recorder.log(
+            "CLOSE",
+            symbol=sym, date=str(date),
+            price=float(price), reason=reason,
+            shares_remaining=float(pos.shares),
+            initial_shares=float(pos.initial_shares),
+            pnl=float(pos.realized_pnl),
+            bars_held=pos.bars_held,
+            entry_price=pos.entry_price,
+            entry_date=str(pos.entry_date),
+            high_water=pos.high_water,
+            partial_exits=pos.partial_exits,
+            stop_history=pos.stop_history,
+        )
+        logger.info(
+            f"[CLOSE] {sym} @{price:.3f} 原因={reason} "
+            f"PnL={pos.realized_pnl:+,.0f} 持仓={pos.bars_held}根"
+        )
         cooldowns[sym] = cfg.cooldown_bars
 
     # ============================================================
     # 主循环
     # ============================================================
     for date in all_dates:
+        reject_log: List[dict] = []
+
+        # (D) 冷却期递减（移到每日开始）
+        for sym in cooldowns:
+            if cooldowns[sym] > 0:
+                cooldowns[sym] -= 1
+
+        # 市场过滤
+        is_market_ok = market_ok.get(date, True)
+        if not is_market_ok:
+            logger.info(f"市场状态不佳，暂停开仓: {date}")
 
         # ----------------------------------------------------
-        # (0) 每日一次：全池打分 + 排名（(A)(B) 段共享）
-        #     过滤条件与建仓端保持一致，避免冷却票、垃圾票混入排名
+        # (0) 全池打分 + 排名
         # ----------------------------------------------------
         daily_scores: Dict[str, float] = {}
-        daily_rows:   Dict[str, pd.Series] = {}   # 今日行（用于成交）
-        daily_prev:   Dict[str, pd.Series] = {}   # 昨日行（用于信号/ATR）
+        daily_rows: Dict[str, pd.Series] = {}
+        daily_prev: Dict[str, pd.Series] = {}
 
         for s, df_s in prepared.items():
-            if s in positions or cooldowns[s] > 0:
+            # ========== 方案 A 修复：已持仓股票也参与打分与排名 ==========
+            # 只跳过冷却期股票，不再跳过已持仓股票
+            if cooldowns[s] > 0:
                 continue
+            # ============================================================
             loc_s = _loc(df_s, date)
             if loc_s is None or loc_s < 1:
                 continue
             prev_s = df_s.iloc[loc_s - 1]
             m_s = signal_multiplier(prev_s)
             atr_s = prev_s.get("ATR", np.nan)
-            if m_s < cfg.min_mult or pd.isna(atr_s) or atr_s <= 0:
+            atr_pct = prev_s.get("ATR_PCT", np.nan)
+
+            if m_s < cfg.min_mult:
+                reject_log.append({
+                    "symbol": s, "date": str(date),
+                    "reason": "below_min_mult", "mult": float(m_s),
+                })
                 continue
+            if pd.isna(atr_s) or atr_s <= 0:
+                reject_log.append({
+                    "symbol": s, "date": str(date),
+                    "reason": "invalid_atr", "atr": float(atr_s)
+                    if not pd.isna(atr_s) else None,
+                })
+                continue
+            if pd.isna(atr_pct) or atr_pct < 1.0 or atr_pct > 8.0:
+                reject_log.append({
+                    "symbol": s, "date": str(date),
+                    "reason": "atr_pct_out_of_range", "atr_pct": float(atr_pct)
+                    if not pd.isna(atr_pct) else None,
+                })
+                continue
+            # 硬性趋势条件
+            big_smooth = prev_s.get("BIG_SCORE_SMOOTH", 0)
+            small_smooth = prev_s.get("SMALL_SCORE_SMOOTH", 0)
+            adx = prev_s.get("ADX", np.nan)
+            if not ((big_smooth >= 2 and small_smooth >= 0) or
+                    (big_smooth >= 0 and small_smooth >= 2)):
+                reject_log.append({
+                    "symbol": s, "date": str(date),
+                    "reason": "trend_filter", "big": float(big_smooth),
+                    "small": float(small_smooth),
+                })
+                continue
+            if pd.isna(adx) or adx < 20:
+                reject_log.append({
+                    "symbol": s, "date": str(date),
+                    "reason": "adx_too_low", "adx": float(adx)
+                    if not pd.isna(adx) else None,
+                })
+                continue
+
             daily_scores[s] = m_s
-            daily_rows[s]   = df_s.iloc[loc_s]
-            daily_prev[s]   = prev_s
+            daily_rows[s] = df_s.iloc[loc_s]
+            daily_prev[s] = prev_s
 
         ranked = sorted(daily_scores, key=lambda x: -daily_scores[x])
         top_set = set(ranked[:cfg.top_n])
 
         # ----------------------------------------------------
-        # (A) 已有持仓逐一管理
+        # (A) 已有持仓管理
         # ----------------------------------------------------
         for sym in list(positions.keys()):
             df = prepared[sym]
@@ -370,12 +534,24 @@ def backtest_pool(
             pos.high_water = max(pos.high_water, float(row["high"]))
             last_close[sym] = float(row["close"])
 
+            if cfg.log_position_daily:
+                recorder.log(
+                    "POS_DAILY", symbol=sym, date=str(date),
+                    close=float(row["close"]),
+                    stop=pos.stop, high_water=pos.high_water,
+                    shares=float(pos.shares),
+                    unrealized_R=((float(row["close"]) - pos.entry_price)
+                                  / pos.r_per_share) if pos.r_per_share else None,
+                )
+
             # ① 止损（跳空按开盘）
             if row["open"] <= pos.stop:
-                _exec_exit(sym, date, float(row["open"]) * (1 - cfg.slippage), "stop_gap")
+                _exec_exit(sym, date,
+                           float(row["open"]) * (1 - cfg.slippage), "stop_gap")
                 continue
             if row["low"] <= pos.stop:
-                _exec_exit(sym, date, pos.stop * (1 - cfg.slippage), "stop")
+                _exec_exit(sym, date,
+                           pos.stop * (1 - cfg.slippage), "stop")
                 continue
 
             # ② 分批止盈
@@ -397,39 +573,71 @@ def backtest_pool(
                 pos.realized_pnl += (fill - pos.entry_price) * sell - fee
                 pos.shares -= sell
                 pos.tp_taken.append(k)
+                pos.total_exit_amount += gross
+                pos.total_exit_shares += sell
                 pos.partial_exits.append({
-                    "date": date, "price": float(fill),
+                    "date": str(date), "price": float(fill),
                     "shares": float(sell), "reason": f"tp_{r_mult}R",
+                    "remaining": float(pos.shares),
+                    "R_multiple": float((fill - pos.entry_price)
+                                        / pos.r_per_share)
+                    if pos.r_per_share else None,
                 })
+                recorder.log(
+                    "TP", symbol=sym, date=str(date),
+                    r_mult=r_mult, price=float(fill),
+                    shares=sell, remaining=float(pos.shares),
+                )
+                logger.info(
+                    f"[TP] {sym} @{fill:.3f} 卖{sell}股 ({r_mult}R) "
+                    f"剩余{int(pos.shares)}"
+                )
 
             if pos.shares < cfg.lot_size:
                 _exec_exit(sym, date, float(row["close"]), "all_tp")
                 continue
 
-            # ③ 趋势反转
-            big_rv = (cfg.exit_on_big_reverse
-                      and int(prev.get("BIG_SCORE", 0) or 0) <= cfg.big_reverse_threshold)
-            small_rv = (cfg.exit_on_small_reverse
-                        and int(prev.get("SMALL_SCORE", 0) or 0) <= cfg.small_reverse_threshold)
+            # ③ 趋势反转（使用平滑分数，且如果已止盈则更严格）
+            big_smooth = prev.get("BIG_SCORE_SMOOTH", 0)
+            small_smooth = prev.get("SMALL_SCORE_SMOOTH", 0)
+            if pos.tp_taken:
+                # 已经止盈过，要求更严格才清仓
+                big_rv = (cfg.exit_on_big_reverse and big_smooth <= -3)
+                small_rv = (cfg.exit_on_small_reverse and small_smooth <= -4)
+            else:
+                big_rv = (cfg.exit_on_big_reverse and
+                          big_smooth <= cfg.big_reverse_threshold and
+                          small_smooth <= 0)
+                small_rv = (cfg.exit_on_small_reverse and
+                            small_smooth <= cfg.small_reverse_threshold)
             if big_rv or small_rv:
                 reason = "trend_reverse_big" if big_rv else "trend_reverse_small"
-                _exec_exit(sym, date, float(row["open"]) * (1 - cfg.slippage), reason)
+                _exec_exit(sym, date,
+                           float(row["open"]) * (1 - cfg.slippage), reason)
                 continue
 
-            # ④ 排名掉队（dropout）—— 用与建仓端一致的过滤排名
-            #    注：仅当该票当前是“可交易状态”（无冷却、信号有效）时才比较
-            #    这样避免自己把自己排掉。冷却中的持仓不会被 dropout 影响。
-            if cfg.exit_on_dropout and cooldowns[sym] == 0:
-                if sym not in top_set:
-                    _exec_exit(sym, date, float(row["close"]) * (1 - cfg.slippage), "dropout")
+            # ④ 排名掉队（带缓冲）—— 方案 A 修复后，持仓股票已进入 ranked
+            if cfg.exit_on_dropout:
+                rank = ranked.index(sym) + 1 if sym in ranked else 9999
+                if rank > cfg.top_n * cfg.dropout_buffer:
+                    _exec_exit(sym, date,
+                               float(row["close"]) * (1 - cfg.slippage),
+                               "dropout")
                     continue
 
             # ⑤ 收盘后更新移动 / 技术止损
             atr_now = prev["ATR"] if not pd.isna(prev["ATR"]) else pos.entry_atr
+            old_stop = pos.stop
+
             if pos.high_water >= pos.entry_price + cfg.trail_activate_R * R:
                 new_trail = pos.high_water - cfg.trail_atr_mult * atr_now
                 if pos.s_trail is None or new_trail > pos.s_trail:
                     pos.s_trail = float(new_trail)
+                    recorder.log(
+                        "TRAIL_ACTIVATE", symbol=sym, date=str(date),
+                        high_water=pos.high_water, trail=pos.s_trail,
+                        atr_now=float(atr_now),
+                    )
 
             sup = row.get("SUPPORT_1", np.nan)
             if not pd.isna(sup) and 0 < sup < row["close"]:
@@ -442,28 +650,42 @@ def backtest_pool(
                 pos.s_init, pos.s_hard, pos.s_tech, pos.s_trail, cfg,
             )
 
+            if abs(pos.stop - old_stop) > 1e-9:
+                pos.stop_history.append({
+                    "date": str(date),
+                    "old": float(old_stop), "new": float(pos.stop),
+                    "high_water": float(pos.high_water),
+                    "s_init": float(pos.s_init),
+                    "s_hard": float(pos.s_hard),
+                    "s_tech": float(pos.s_tech) if pos.s_tech is not None else None,
+                    "s_trail": float(pos.s_trail) if pos.s_trail is not None else None,
+                })
+                recorder.log(
+                    "STOP_MOVE", symbol=sym, date=str(date),
+                    old_stop=float(old_stop), new_stop=float(pos.stop),
+                    high_water=float(pos.high_water),
+                )
+
         # ----------------------------------------------------
-        # (B) 横截面建仓：复用同一份 ranked
+        # (B) 横截面建仓
         # ----------------------------------------------------
         slots = cfg.top_n - len(positions)
-        if slots > 0:
-
-            # 组合当前权益（用于每票风险预算基数）
+        new_positions_today = 0
+        if slots > 0 and is_market_ok:
             total_eq = cash + sum(
                 positions[s].shares *
-                (last_close[s] if not pd.isna(last_close[s]) else positions[s].entry_price)
+                (last_close[s] if not pd.isna(last_close[s])
+                 else positions[s].entry_price)
                 for s in positions
             )
-            per_slot_eq = total_eq / cfg.top_n
 
-            # 按 ranked 顺序依次建仓，直到填满或现金不足
-            for sym in ranked:
-                if slots <= 0:
+            for rank_idx, sym in enumerate(ranked, start=1):
+                if slots <= 0 or new_positions_today >= cfg.max_new_positions_per_day:
                     break
-                if sym in positions:          # 刚被 (A) 段处理过 / 已持有
+                if sym in positions:
                     continue
 
-                m   = daily_scores[sym]
+                m = daily_scores[sym]
                 row = daily_rows[sym]
                 prev = daily_prev[sym]
                 atr_prev = float(prev["ATR"])
@@ -471,43 +693,113 @@ def backtest_pool(
                 entry = float(row["open"]) * (1 + cfg.slippage)
                 support = prev.get("SUPPORT_1", np.nan)
 
-                s_init, s_hard, s_tech = compute_initial_stops(entry, atr_prev, support, cfg)
-                stop = effective_stop(entry, atr_prev, s_init, s_hard, s_tech, None, cfg)
+                s_init, s_hard, s_tech = compute_initial_stops(
+                    entry, atr_prev, support, cfg)
+                stop = effective_stop(entry, atr_prev,
+                                      s_init, s_hard, s_tech, None, cfg)
 
-                shares, r_share, _ = compute_position_size(
-                    per_slot_eq, entry, stop, m, cfg
-                )
-                # 现金约束（防止多票同时建仓超支）
-                max_sh = int((cash * cfg.cash_buffer) // (entry * cfg.lot_size)) * cfg.lot_size
+                shares, r_share, risk_budget = compute_position_size(
+                    total_eq, entry, stop, m, cfg)
+
+                max_sh = int((cash * cfg.cash_buffer)
+                             // (entry * cfg.lot_size)) * cfg.lot_size
                 shares = min(shares, max_sh)
 
                 cost = shares * entry
                 fee = cost * cfg.commission
-                if shares >= cfg.lot_size and cost + fee <= cash:
-                    cash -= (cost + fee)
-                    positions[sym] = Position(
-                        entry_date=date, entry_price=entry,
-                        shares=float(shares), initial_shares=float(shares),
-                        r_per_share=r_share,
-                        s_init=s_init, s_hard=s_hard, s_tech=s_tech,
-                        stop=stop, entry_atr=atr_prev, entry_mult=m,
-                    )
-                    last_close[sym] = float(row["close"])
-                    slots -= 1
+
+                if shares < cfg.lot_size:
+                    reject_log.append({
+                        "symbol": sym, "date": str(date),
+                        "reason": "size_too_small",
+                        "mult": float(m), "entry": entry, "stop": stop,
+                        "shares_raw": int(shares),
+                        "cash": float(cash), "total_eq": float(total_eq),
+                    })
+                    continue
+                if cost + fee > cash:
+                    reject_log.append({
+                        "symbol": sym, "date": str(date),
+                        "reason": "insufficient_cash",
+                        "need": float(cost + fee), "cash": float(cash),
+                    })
+                    continue
+
+                # ---- 正式建仓 ----
+                cash_before = cash
+                cash -= (cost + fee)
+
+                signal_snapshot = {
+                    "BIG_SCORE": _safe_float(prev.get("BIG_SCORE", 0), 0.0),
+                    "SMALL_SCORE": _safe_float(prev.get("SMALL_SCORE", 0), 0.0),
+                    "BIG_SCORE_SMOOTH": _safe_float(prev.get("BIG_SCORE_SMOOTH", 0), 0.0),
+                    "SMALL_SCORE_SMOOTH": _safe_float(prev.get("SMALL_SCORE_SMOOTH", 0), 0.0),
+                    "ADX": _safe_float(prev.get("ADX", np.nan)),
+                    "TREND_HEALTH": _safe_float(prev.get("TREND_HEALTH", np.nan)),
+                    "BREAK_SCORE": int(prev.get("BREAK_SCORE", 0) or 0),
+                    "TOP_WARN": bool(prev.get("TOP_WARN", False)),
+                    "BOTTOM_WARN": bool(prev.get("BOTTOM_WARN", False)),
+                    "support": (float(support)
+                                if not pd.isna(support) else None),
+                    "ATR_prev": atr_prev,
+                    "multiplier": float(m),
+                    "rank": rank_idx,
+                }
+                ctx_snapshot = {
+                    "total_eq": float(total_eq),
+                    "cash_before": float(cash_before),
+                    "risk_budget": float(risk_budget),
+                    "cap_shares": int(total_eq * cfg.max_position_pct
+                                      / entry // cfg.lot_size) * cfg.lot_size,
+                    "cash_cap_shares": int(max_sh),
+                    "final_shares": int(shares),
+                    "entry_price": float(entry),
+                    "s_init": float(s_init),
+                    "s_hard": float(s_hard),
+                    "s_tech": (float(s_tech)
+                               if s_tech is not None else None),
+                    "stop_effective": float(stop),
+                    "r_per_share": float(r_share),
+                    "slippage_paid": float(float(row["open"])
+                                           * cfg.slippage * shares),
+                    "fee_paid": float(fee),
+                }
+
+                pos = Position(
+                    entry_date=date, entry_price=entry,
+                    shares=float(shares), initial_shares=float(shares),
+                    r_per_share=r_share,
+                    s_init=s_init, s_hard=s_hard, s_tech=s_tech,
+                    stop=stop, entry_atr=atr_prev, entry_mult=m,
+                )
+                pos.entry_signal = signal_snapshot
+                pos.entry_ctx = ctx_snapshot
+                positions[sym] = pos
+                last_close[sym] = float(row["close"])
+                slots -= 1
+                new_positions_today += 1
+
+                recorder.log("OPEN", symbol=sym, date=str(date),
+                             **signal_snapshot, **ctx_snapshot)
+                logger.info(
+                    f"[OPEN] {sym} @{entry:.3f} 股数={int(shares)} "
+                    f"止损={stop:.3f} 排名#{rank_idx} "
+                    f"mult={m:.2f} 风险预算={risk_budget:,.0f}"
+                )
 
         # ----------------------------------------------------
-        # 冷却期递减
+        # (C) 记录被拒的候选
         # ----------------------------------------------------
-        for sym in cooldowns:
-            if cooldowns[sym] > 0:
-                cooldowns[sym] -= 1
+        for r in reject_log:
+            recorder.log("REJECT", **r)
 
         # ----------------------------------------------------
-        # (C) 记录组合净值
+        # (E) 记录组合净值
         # ----------------------------------------------------
         mv = sum(
             pos.shares *
-            (last_close[sym] if not pd.isna(last_close[sym]) else pos.entry_price)
+            (last_close[sym] if not pd.isna(last_close[sym])
+             else pos.entry_price)
             for sym, pos in positions.items()
         )
         equity_curve.append({
@@ -518,7 +810,16 @@ def backtest_pool(
             "n_positions": len(positions),
         })
 
-    # ---------- 收尾：最后一日收盘平仓 ----------
+        recorder.log(
+            "DAILY", date=str(date),
+            equity=float(cash + mv), cash=float(cash), mv=float(mv),
+            n_positions=len(positions),
+            top_rank=ranked[:cfg.top_n],
+            top_scores=[round(float(daily_scores[s]), 3)
+                        for s in ranked[:cfg.top_n]],
+        )
+
+    # ---------- 收尾 ----------
     for sym in list(positions.keys()):
         df = prepared[sym]
         _exec_exit(sym, df.index[-1],
@@ -527,12 +828,19 @@ def backtest_pool(
 
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_curve).set_index("date")
+
+    trades_df.to_csv(run_dir / "trades.csv", index=False, encoding="utf-8-sig")
+    equity_df.to_csv(run_dir / "daily.csv", encoding="utf-8-sig")
+
+    logger.info(
+        f"回测完成 | 交易 {len(trades_df)} 笔 | "
+        f"最终权益 {equity_df['equity'].iloc[-1]:,.0f}"
+    )
+    if not trades_df.empty:
+        logger.info(f"离场原因分布: {trades_df['reason'].value_counts().to_dict()}")
+
+    recorder.close()
     return trades_df, equity_df
-
-
-
-
-
 
 
 # ============================================================
@@ -608,7 +916,7 @@ def report(trades: pd.DataFrame, equity: pd.DataFrame,
 
 def pool_report(trades: pd.DataFrame, equity: pd.DataFrame,
                 initial_equity: float) -> dict:
-    metrics = report(trades, equity, initial_equity)  # 复用原报告
+    metrics = report(trades, equity, initial_equity)
 
     if trades.empty:
         return metrics
@@ -631,39 +939,53 @@ def pool_report(trades: pd.DataFrame, equity: pd.DataFrame,
     return metrics
 
 
-
-
-
-
-
 # ============================================================
 # 8. 使用示例
 # ============================================================
 if __name__ == "__main__":
-    # ---- 上游：拿到含技术信号的 df ----
     import sys
-    from pathlib import Path
-    project_root = Path(__file__).resolve().parent.parent
+    from pathlib import Path as _P
+
+    project_root = _P(__file__).resolve().parent.parent
     sys.path.insert(0, str(project_root))
-    # from utils.text_utils import read_from_csv
+
     from strategy.tech_analysis import get_stock_data, compute_trend
+
     data_dict = {
-    "sh.600584": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.600584_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
-    "sh.601020": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.601020_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
-    "sh.603986": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.603986_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
-    "sh.605255": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.605255_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
-    "sh.688256": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.688256_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
-    "sh.688525": compute_trend(get_stock_data("/home/omen/work/quant/data/data_sh.688525_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.600584": compute_trend(get_stock_data("test_data/data_sh.600584_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.601020": compute_trend(get_stock_data("test_data/data_sh.601020_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.603986": compute_trend(get_stock_data("test_data/data_sh.603986_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.605255": compute_trend(get_stock_data("test_data/data_sh.605255_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.688256": compute_trend(get_stock_data("test_data/data_sh.688256_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
+        "sh.688525": compute_trend(get_stock_data("test_data/data_sh.688525_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
     }
 
+    # 可选：加载大盘数据，例如沪深300指数
+    # market_df = get_stock_data("test_data/data_sh.000300_stock_price.csv")
+    market_df = None
+
     cfg = PositionConfig(
-    top_n=5,
-    min_mult=0.15,          # 打分 < 0.15 不进池
-    base_risk_pct=0.008,    # 池化后单笔风险略降
-    max_position_pct=0.22,  # 单票上限 = 1/top_n ≈ 20%
-    cooldown_bars=3,
+        top_n=5,
+        min_mult=0.30,
+        base_risk_pct=0.02,
+        max_position_pct=0.20,
+        cooldown_bars=10,
+        init_atr_mult=2.0,
+        trail_atr_mult=2.5,
+        trail_activate_R=2.0,
+        hard_max_loss_pct=0.06,
+        tp_levels=((1.5, 0.33), (3.0, 0.33)),
+        exit_on_dropout=True,
+        dropout_buffer=2,
+        max_new_positions_per_day=2,
+        log_position_daily=False,
     )
 
-    trades, equity = backtest_pool(data_dict, cfg, initial_equity=1_000_000)
+    trades, equity = backtest_pool(
+        data_dict, cfg,
+        initial_equity=1_000_000,
+        log_dir="logs",
+        market_df=market_df,
+    )
     pool_report(trades, equity, 1_000_000)
 

@@ -1,48 +1,51 @@
-import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('app.log', mode='w'),
-#        logging.StreamHandler()
-    ]
-)
+# import logging
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.FileHandler('app.log', mode='w'),
+# #        logging.StreamHandler()
+#     ]
+# )
 
-# from utils.text_utils import fund_screen_prosperity, fund_screen_policy_match
-# fund_screen_prosperity()
+from utils.text_utils import read_hs300_constituents
+df_hs300 = read_hs300_constituents('data/hs300_constituents_2021_2026.csv')
+hs300_list = df_hs300.loc[df_hs300['query_date']=='2021-01-01']['code'].tolist()
 
-# from utils.text_utils import read_screened_company_codes
-# code_list = read_screened_company_codes(
-#         "policy_match_results.csv",
-#         "prosperity_results.csv")
-# print(code_list)
 # from data.fetch_daily_k import get_daily_data
-# all_df = get_daily_data(code_list)
+# all_df = get_daily_data(hs300_list)
+
+from utils.text_utils import read_screened_company_codes
+screened_list = read_screened_company_codes(
+        "policy_match_results.csv",
+        "prosperity_results.csv")
 
 
-from strategy.tech_analysis import get_stock_data, compute_trend
-from pathlib import Path
-data_dict = {}
-folder = Path("stock_daily_k/individual")  # 例如 r"C:\data" 或 "/home/user/data"
-for file in folder.glob("*.csv"):
-    code = file.name.replace("_", ".")[:-4]
-    data_dict[code] = compute_trend(get_stock_data(file), adx_threshold=20, adx_mode="shrink")
+def backtest(code_list):
+    from strategy.multi_stock_cross_section import PositionConfig, backtest_pool, pool_report
+    from strategy.tech_analysis import get_stock_data, compute_trend
+    data_dict = {}
+    for code in code_list:
+        if code.startswith(("60", "68", "51", "58", "11", "90", "50")):
+            filename = f"stock_daily_k/individual/sh_{code}.csv"
+        if code.startswith(("00", "30", "12", "15", "16", "18", "20", "39", "13")):
+            filename = f"stock_daily_k/individual/sz_{code}.csv"
+        if code.startswith(("43", "83", "87", "88", "92")):
+            filename = f"stock_daily_k/individual/bj_{code}.csv"
 
-# print(data_dict)
-
-from strategy.multi_stock_cross_section import PositionConfig, backtest_pool, pool_report
-cfg = PositionConfig(
-    top_n=50,
-    min_mult=0.15,          # 打分 < 0.15 不进池
-    base_risk_pct=0.008,    # 池化后单笔风险略降
-    max_position_pct=0.02,  # 单票上限 = 1/top_n 
-    cooldown_bars=3,
-)
-
-trades, equity = backtest_pool(data_dict, cfg, initial_equity=1_000_000)
-pool_report(trades, equity, 1_000_000)
+        data_dict[code] = compute_trend(get_stock_data(filename), adx_threshold=20, adx_mode="shrink")
+    
+    trades, equity = backtest_pool(data_dict, initial_equity=1_000_000)
+    pool_report(trades, equity, 1_000_000)
 
 
+print('=='*20)
+print('stock pool of all hs300')
+backtest(hs300_list)
+print('=='*20)
 
-
+# print('=='*20)
+# print('stock pool of screened stocks')
+# backtest(screened_list)
+# print('=='*20)
 
