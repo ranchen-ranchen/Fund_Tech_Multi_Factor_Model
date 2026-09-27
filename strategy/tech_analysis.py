@@ -383,9 +383,9 @@ def compute_trend(df, adx_threshold=20, adx_mode="shrink",
 
     df = apply_adx_gate(df, adx_threshold=adx_threshold, mode=adx_mode)
 
-    # 新增：平滑趋势分数，降低单日噪声
-    df["BIG_SCORE_SMOOTH"] = df["BIG_SCORE"].rolling(3, min_periods=1).mean()
-    df["SMALL_SCORE_SMOOTH"] = df["SMALL_SCORE"].rolling(3, min_periods=1).mean()
+    # 修改：使用5日EMA平滑趋势分数，降低单日噪声
+    df["BIG_SCORE_SMOOTH"] = df["BIG_SCORE"].ewm(span=5, adjust=False).mean()
+    df["SMALL_SCORE_SMOOTH"] = df["SMALL_SCORE"].ewm(span=5, adjust=False).mean()
 
     return df
 
@@ -573,3 +573,4 @@ if __name__ == "__main__":
               "TOP_WARN", "BOTTOM_WARN"]].tail(20).round(2))
 
     result = analyze(df)
+
