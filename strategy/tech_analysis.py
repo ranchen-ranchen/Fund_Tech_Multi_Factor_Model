@@ -1,12 +1,32 @@
-import pandas as pd
+# tech_analysis.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+
+import sys
+from pathlib import Path
+
+# 把项目根目录加入 sys.path
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root / "utils"))
+
+from calc_utils import (
+        add_adx, add_atr, add_ma, add_macd, rolling_slope,
+        trend_state, TREND_LABEL,
+)
 
 
+# ============================================================
+# 数据读取
+# ============================================================
 def get_stock_data(filename):
-    import sys
-    from pathlib import Path
     project_root = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(project_root))
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
     from utils.text_utils import read_from_csv
 
     df = read_from_csv(filename)
@@ -15,78 +35,8 @@ def get_stock_data(filename):
     return df[["open", "high", "low", "close", "volume"]]
 
 
-def add_ma(df, windows=(5, 10, 20, 60, 120, 250)):
-    for n in windows:
-        df[f"MA{n}"] = df["close"].rolling(n).mean()
-    return df
-
-
-def add_macd(df, fast=12, slow=26, signal=9):
-    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
-    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
-    df["DIF"] = ema_fast - ema_slow
-    df["DEA"] = df["DIF"].ewm(span=signal, adjust=False).mean()
-    df["MACD_HIST"] = 2 * (df["DIF"] - df["DEA"])
-    return df
-
-
-def add_adx(df, period=14):
-    """ADX 趋势强度指标"""
-    high, low, close = df["high"], df["low"], df["close"]
-    up, down = high.diff(), -low.diff()
-
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(
-        alpha=1 / period, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(
-        alpha=1 / period, adjust=False).mean() / atr
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-
-    df["PLUS_DI"] = plus_di
-    df["MINUS_DI"] = minus_di
-    df["ADX"] = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return df
-
-
-def add_atr(df, period=14):
-    """ATR 指标"""
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.ewm(alpha=1 / period, adjust=False).mean()
-    df["ATR_PCT"] = df["ATR"] / df["close"] * 100
-    return df
-
-
-def rolling_slope(series, window):
-    """滚动线性回归斜率（未归一化）"""
-    x = np.arange(window)
-    x_mean = x.mean()
-    denom = ((x - x_mean) ** 2).sum()
-
-    def _slope(y):
-        if np.isnan(y).any():
-            return np.nan
-        return ((x - x_mean) * (y - y.mean())).sum() / denom
-
-    return series.rolling(window).apply(_slope, raw=True)
-
-
 # ============================================================
-# 支撑 / 阻力位
+# 支撑 / 阻力
 # ============================================================
 def _cluster_levels(levels, tolerance):
     if not levels:
@@ -142,10 +92,8 @@ def add_support_resistance(df, pivot_window=5, lookback=120,
 
         price = cl_np[i]
         clusters = _cluster_levels(levels, tolerance)
-
         sups = sorted([c for c in clusters if c < price], reverse=True)[:max_levels]
         ress = sorted([c for c in clusters if c > price])[:max_levels]
-
         for k, v in enumerate(sups):
             sup_arr[i, k] = v
         for k, v in enumerate(ress):
@@ -200,7 +148,6 @@ def add_volume_features(df):
     df["VOL_MA5"] = vol.rolling(5).mean()
     df["VOL_MA20"] = vol.rolling(20).mean()
     df["VOL_MA60"] = vol.rolling(60).mean()
-
     df["VOL_RATIO"] = vol / df["VOL_MA20"].replace(0, np.nan)
     df["VOL_RATIO_MA5"] = df["VOL_RATIO"].rolling(5).mean()
 
@@ -211,6 +158,26 @@ def add_volume_features(df):
     std = vol.rolling(20).std()
     df["VOL_Z"] = ((vol - df["VOL_MA20"]) / std.replace(0, np.nan)).fillna(0)
     return df
+
+
+def _build_break_type(df: pd.DataFrame) -> pd.Series:
+    """向量化构造 BREAK_TYPE 字符串。"""
+    parts = np.full(len(df), "", dtype=object)
+    for cond, name in (
+        (df["BREAK_MA20"].to_numpy(), "MA20"),
+        (df["BREAK_MA60"].to_numpy(), "MA60"),
+        (df["BREAK_RES"].to_numpy(), "前高"),
+    ):
+        sep = np.where((parts != "") & cond, "/", "")
+        parts = np.where(cond, parts + sep + name, parts)
+
+    confirmed = (
+        df["BREAK_MA20_OK"] | df["BREAK_MA60_OK"] | df["BREAK_RES_OK"]
+    ).to_numpy()
+    any_break = parts != ""
+    prefix = np.where(confirmed, "放量突破(", "缩量突破(")
+    result = np.where(any_break, prefix + parts + ")", "")
+    return pd.Series(result, index=df.index)
 
 
 def add_breakout_confirmation(df, vol_ok=1.5, vol_strong=2.0, vol_weak=0.8):
@@ -241,18 +208,7 @@ def add_breakout_confirmation(df, vol_ok=1.5, vol_strong=2.0, vol_weak=0.8):
     score[weak] = -1
     score[strong] = 2
     df["BREAK_SCORE"] = score
-
-    def _type(r):
-        tags = []
-        if r["BREAK_MA20"]: tags.append("MA20")
-        if r["BREAK_MA60"]: tags.append("MA60")
-        if r["BREAK_RES"]: tags.append("前高")
-        if not tags:
-            return ""
-        confirmed = r["BREAK_MA20_OK"] or r["BREAK_MA60_OK"] or r["BREAK_RES_OK"]
-        return f"{'放量' if confirmed else '缩量'}突破({'/'.join(tags)})"
-
-    df["BREAK_TYPE"] = df.apply(_type, axis=1)
+    df["BREAK_TYPE"] = _build_break_type(df)
     return df
 
 
@@ -342,7 +298,7 @@ def compute_trend(df, adx_threshold=20, adx_mode="shrink",
     df = add_ma(df)
     df = add_macd(df)
     df = add_adx(df)
-    df = add_atr(df)                     # 新增 ATR
+    df = add_atr(df)
     df = add_support_resistance(df,
                                 pivot_window=pivot_window,
                                 lookback=sr_lookback,
@@ -383,42 +339,32 @@ def compute_trend(df, adx_threshold=20, adx_mode="shrink",
 
     df = apply_adx_gate(df, adx_threshold=adx_threshold, mode=adx_mode)
 
-    # 修改：使用5日EMA平滑趋势分数，降低单日噪声
     df["BIG_SCORE_SMOOTH"] = df["BIG_SCORE"].ewm(span=5, adjust=False).mean()
     df["SMALL_SCORE_SMOOTH"] = df["SMALL_SCORE"].ewm(span=5, adjust=False).mean()
-
     return df
 
 
 # ============================================================
-# 研判输出（保持原样）
+# 研判输出
 # ============================================================
-def _state(score):
-    if score >= 2:
-        return "向上"
-    if score <= -2:
-        return "向下"
-    return "中性"
-
-
 DECISION_MAP = {
-    ("向上", "向上"): ("主升浪", "持股 / 逢回调加仓", "🟢🟢"),
-    ("向上", "中性"): ("上升途中的整理", "持股观察，跌破MA20减仓", "🟢"),
-    ("向上", "向下"): ("上升趋势中的回调", "不追高，等小趋势重新走强再介入", "🟡"),
-    ("中性", "向上"): ("震荡市中的反弹", "短线可参与，快进快出", "🟡"),
-    ("中性", "中性"): ("无趋势 / 横盘", "观望，等方向明确", "⚪"),
-    ("中性", "向下"): ("震荡转弱", "减仓规避", "🟠"),
-    ("向下", "向上"): ("下跌趋势中的反弹", "反弹减仓，不抄底", "🟠"),
-    ("向下", "中性"): ("弱势整理", "空仓或极轻仓", "🔴"),
-    ("向下", "向下"): ("空头排列", "空仓等待", "🔴🔴"),
+    (1, 1): ("主升浪", "持股 / 逢回调加仓", "🟢🟢"),
+    (1, 0): ("上升途中的整理", "持股观察，跌破MA20减仓", "🟢"),
+    (1, -1): ("上升趋势中的回调", "不追高，等小趋势重新走强再介入", "🟡"),
+    (0, 1): ("震荡市中的反弹", "短线可参与，快进快出", "🟡"),
+    (0, 0): ("无趋势 / 横盘", "观望，等方向明确", "⚪"),
+    (0, -1): ("震荡转弱", "减仓规避", "🟠"),
+    (-1, 1): ("下跌趋势中的反弹", "反弹减仓，不抄底", "🟠"),
+    (-1, 0): ("弱势整理", "空仓或极轻仓", "🔴"),
+    (-1, -1): ("空头排列", "空仓等待", "🔴🔴"),
 }
 
 
 def analyze(df, date=None):
     row = df.iloc[-1] if date is None else df.loc[date]
 
-    big_state = _state(row["BIG_SCORE"])
-    small_state = _state(row["SMALL_SCORE"])
+    big_state = trend_state(row["BIG_SCORE"])
+    small_state = trend_state(row["SMALL_SCORE"])
     desc, action, icon = DECISION_MAP[(big_state, small_state)]
 
     adx = row["ADX"]
@@ -434,25 +380,16 @@ def analyze(df, date=None):
         tag = "已向 0 收缩" if mode == "shrink" else "已归 0 判定震荡 "
         adx_txt = f"{adx:.1f} 无趋势/震荡，分数{tag} "
 
-    def _fmt(score, raw):
-        s = int(score)
-        if row["ADX_WEAK"] and int(raw) != s:
-            return f"{s:+d} (原始 {int(raw):+d})"
-        return f"{s:+d}"
-
-    big_disp = _fmt(row["BIG_SCORE"], row["BIG_SCORE_RAW"])
-    small_disp = _fmt(row["SMALL_SCORE"], row["SMALL_SCORE_RAW"])
-
     print("=" * 62)
     print(f"日期: {row.name.date()}   收盘价: {row['close']:.2f}")
     print("-" * 62)
-    print(f"【大趋势】{big_state}   得分 {int(row['BIG_SCORE']):+d} / 4")
+    print(f"【大趋势】{TREND_LABEL[big_state]}   得分 {int(row['BIG_SCORE']):+d} / 4")
     print(f"   价格 vs MA120 : {row['close']:.2f} vs {row['MA120']:.2f}")
     print(f"   MA60  vs MA120: {row['MA60']:.2f} vs {row['MA120']:.2f}")
     print(f"   MA120 斜率    : {row['SLOPE_MA120']:+.3f} % / 日")
     print(f"   周线 MACD     : DIF {row['W_DIF']:+.3f} / DEA {row['W_DEA']:+.3f}")
     print("-" * 62)
-    print(f"【小趋势】{small_state}   得分 {int(row['SMALL_SCORE']):+d} / 4")
+    print(f"【小趋势】{TREND_LABEL[small_state]}   得分 {int(row['SMALL_SCORE']):+d} / 4")
     print(f"   价格 vs MA20  : {row['close']:.2f} vs {row['MA20']:.2f}")
     print(f"   MA5/10/20     : {row['MA5']:.2f} / {row['MA10']:.2f} / {row['MA20']:.2f}")
     print(f"   日线 MACD     : DIF {row['DIF']:+.3f} / DEA {row['DEA']:+.3f}")
@@ -503,7 +440,8 @@ def analyze(df, date=None):
             tag = "缩量"
         else:
             tag = "正常"
-        print(f"   量比 VOL/MA20 : {vol_ratio:.2f}（{tag}）  VOL_MA5/MA20 = {row['VOL_MA5']/row['VOL_MA20']:.2f}")
+        print(f"   量比 VOL/MA20 : {vol_ratio:.2f}（{tag}）  "
+              f"VOL_MA5/MA20 = {row['VOL_MA5']/row['VOL_MA20']:.2f}")
 
     health = row.get("TREND_HEALTH", np.nan)
     if not pd.isna(health):
@@ -515,7 +453,8 @@ def analyze(df, date=None):
             htxt = f"{health:+.0f}（偏弱）"
         else:
             htxt = f"{health:+.0f}（不健康）"
-        print(f"   趋势健康度    : {htxt}   （量能结构 {row['VOL_HEALTH']:+.0f} / OBV一致 {row['OBV_AGREE']:+d}）")
+        print(f"   趋势健康度    : {htxt}   "
+              f"（量能结构 {row['VOL_HEALTH']:+.0f} / OBV一致 {row['OBV_AGREE']:+d}）")
 
     bt = row.get("BREAK_TYPE", "")
     if bt:
@@ -533,9 +472,11 @@ def analyze(df, date=None):
     print("=" * 62)
 
     return {
-        "big_trend": big_state, "big_score": int(row["BIG_SCORE"]),
+        "big_trend": TREND_LABEL[big_state],
+        "big_score": int(row["BIG_SCORE"]),
         "big_score_raw": int(row["BIG_SCORE_RAW"]),
-        "small_trend": small_state, "small_score": int(row["SMALL_SCORE"]),
+        "small_trend": TREND_LABEL[small_state],
+        "small_score": int(row["SMALL_SCORE"]),
         "small_score_raw": int(row["SMALL_SCORE_RAW"]),
         "adx": round(float(adx), 2),
         "adx_weak": bool(row["ADX_WEAK"]),
@@ -549,8 +490,10 @@ def analyze(df, date=None):
         "dist_support": None if pd.isna(dist_sup) else round(float(dist_sup), 2),
         "dist_resistance": None if pd.isna(dist_res) else round(float(dist_res), 2),
         "sr_position": sr_pos,
-        "vol_ratio": None if pd.isna(row.get("VOL_RATIO", np.nan)) else round(float(row["VOL_RATIO"]), 2),
-        "trend_health": None if pd.isna(row.get("TREND_HEALTH", np.nan)) else round(float(row["TREND_HEALTH"]), 1),
+        "vol_ratio": None if pd.isna(row.get("VOL_RATIO", np.nan))
+                      else round(float(row["VOL_RATIO"]), 2),
+        "trend_health": None if pd.isna(row.get("TREND_HEALTH", np.nan))
+                         else round(float(row["TREND_HEALTH"]), 1),
         "break_type": row.get("BREAK_TYPE", "") or None,
         "break_score": int(row.get("BREAK_SCORE", 0)),
         "top_warn": bool(row.get("TOP_WARN", False)),
@@ -560,9 +503,6 @@ def analyze(df, date=None):
     }
 
 
-# ============================================================
-# 运行示例
-# ============================================================
 if __name__ == "__main__":
     df = get_stock_data('test_data/data_sh.688783_stock_price.csv')
     df = compute_trend(df, adx_threshold=20, adx_mode="shrink")
@@ -572,5 +512,4 @@ if __name__ == "__main__":
               "VOL_RATIO", "TREND_HEALTH", "BREAK_SCORE",
               "TOP_WARN", "BOTTOM_WARN"]].tail(20).round(2))
 
-    result = analyze(df)
-
+    analyze(df)

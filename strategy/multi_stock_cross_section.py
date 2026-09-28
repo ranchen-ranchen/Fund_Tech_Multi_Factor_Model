@@ -12,25 +12,16 @@ import pandas as pd
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Tuple, Dict
 
+# 把项目根目录加入 sys.path
+import sys
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root / "utils"))
 
-# ============================================================
-# 0. ATR 指标（若上游未提供则自动补算）
-# ============================================================
-def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    df = df.copy()
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-    df["ATR_PCT"] = df["ATR"] / df["close"] * 100
-    return df
+from calc_utils import add_atr, trend_state
 
 
 # ============================================================
-# 0'. 日志基础设施
+# 日志基础设施
 # ============================================================
 def _setup_logger(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -84,28 +75,22 @@ class EventRecorder:
 
 
 # ============================================================
-# 1. 配置
+# 配置
 # ============================================================
 @dataclass
 class PositionConfig:
-    # ---------- 风险预算 ----------
-    base_risk_pct: float = 0.01          # 单笔基础风险降至 1%
-    max_position_pct: float = 0.20       # 单票最大仓位 20%
+    base_risk_pct: float = 0.01
+    max_position_pct: float = 0.20
     lot_size: int = 100
+    max_total_risk_pct: float = 0.06
 
-    # ---------- 总风险敞口 ----------
-    max_total_risk_pct: float = 0.06     # 同时持仓总风险不超过 6%
-
-    # ---------- 回撤控制 ----------
-    drawdown_halve_threshold: float = 0.10   # 回撤 ≥ 10% 时新仓规模减半
+    drawdown_halve_threshold: float = 0.10
     drawdown_halve_mult: float = 0.5
-    drawdown_stop_threshold: float = 0.20    # 回撤 ≥ 20% 时停开仓
-    drawdown_stop_days: int = 5              # 停开仓天数（一周交易日）
+    drawdown_stop_threshold: float = 0.20
+    drawdown_stop_days: int = 5
 
-    # ---------- ATR ----------
     atr_period: int = 14
 
-    # ---------- 分层止损 ----------
     init_atr_mult: float = 3.5
     tech_stop_buffer: float = 0.005
     trail_atr_mult: float = 2.5
@@ -113,59 +98,41 @@ class PositionConfig:
     hard_max_loss_pct: float = 0.10
     min_stop_atr: float = 0.5
 
-    # ---------- 动态止损 ----------
     atr_pct_ma_window: int = 20
     dynamic_stop_min_mult: float = 0.8
     dynamic_stop_max_mult: float = 1.5
 
-    # ---------- 保本止损 ----------
     breakeven_activate_R: float = 2.0
 
-    # ---------- 分批止盈 ----------
     tp_levels: Tuple[Tuple[float, float], ...] = (
         (1.5, 0.20),
         (3.0, 0.30),
     )
 
-    # ---------- 趋势反转清仓 ----------
     exit_on_big_reverse: bool = True
     exit_on_small_reverse: bool = False
     big_reverse_threshold: int = -2
     small_reverse_threshold: int = -3
 
-    # ---------- 冷却期 ----------
     cooldown_bars: int = 10
 
-    # ---------- 回测摩擦 ----------
     slippage: float = 0.0005
     commission: float = 0.0003
 
-    # ---------- 池化参数 ----------
     top_n: int = 5
-    min_mult: float = 0.50               # 提高开仓门槛至 0.5
+    min_mult: float = 0.50
     cash_buffer: float = 0.98
     exit_on_dropout: bool = True
     dropout_buffer: int = 4
     max_new_positions_per_day: int = 1
     rebalance_weekly: bool = True
 
-    # ---------- 日志 ----------
     log_position_daily: bool = False
 
 
 # ============================================================
-# 2. 信号 → 仓位乘数
+# 信号 → 仓位乘数
 # ============================================================
-def _trend_state(score: float) -> int:
-    if pd.isna(score):
-        return 0
-    if score >= 2:
-        return 1
-    if score <= -2:
-        return -1
-    return 0
-
-
 _STATE_MULT: Dict[Tuple[int, int], float] = {
     ( 1,  1): 1.00,
     ( 1,  0): 0.70,
@@ -180,13 +147,14 @@ _STATE_MULT: Dict[Tuple[int, int], float] = {
 
 
 def signal_multiplier(row: pd.Series) -> float:
+    """返回仓位乘数；返回 0 表示不允许开仓。"""
     big = float(row.get("BIG_SCORE_SMOOTH", 0) or 0)
     small = float(row.get("SMALL_SCORE_SMOOTH", 0) or 0)
 
     if not ((big >= 2 and small >= 0) or (big >= 0 and small >= 2)):
         return 0.0
 
-    mult = _STATE_MULT.get((_trend_state(big), _trend_state(small)), 0.0)
+    mult = _STATE_MULT.get((trend_state(big), trend_state(small)), 0.0)
     if mult <= 0:
         return 0.0
 
@@ -209,7 +177,7 @@ def signal_multiplier(row: pd.Series) -> float:
 
 
 # ============================================================
-# 3. 分层止损计算
+# 分层止损
 # ============================================================
 def compute_initial_stops(entry: float, atr: float, support: Optional[float],
                           cfg: PositionConfig, dynamic_mult: float = 1.0):
@@ -233,7 +201,6 @@ def effective_stop(entry: float, atr: float, s_init: float, s_hard: float,
         cands.append(s_trail)
 
     stop = max(cands)
-
     floor = entry - cfg.min_stop_atr * atr
     stop = min(stop, floor)
     stop = max(stop, s_hard)
@@ -242,32 +209,27 @@ def effective_stop(entry: float, atr: float, s_init: float, s_hard: float,
 
 
 # ============================================================
-# 4. 风险预算法仓位
+# 风险预算法仓位
 # ============================================================
 def compute_position_size(equity: float, entry: float, stop: float,
                           multiplier: float, cfg: PositionConfig,
                           size_scale: float = 1.0
                           ) -> Tuple[int, float, float]:
-    """
-    基于风险预算法计算股数。
-    size_scale 用于回撤减半等全局缩仓控制。
-    """
+    """仅做风险预算 + 单票上限；其它约束由主循环统一处理。"""
     r = entry - stop
     if r <= 0 or multiplier <= 0:
         return 0, 0.0, 0.0
 
     risk_budget = equity * cfg.base_risk_pct * multiplier * size_scale
     shares = risk_budget / r
-
     cap_shares = equity * cfg.max_position_pct / entry
     shares = min(shares, cap_shares)
-
     shares = int(shares // cfg.lot_size) * cfg.lot_size
     return shares, float(r), float(risk_budget)
 
 
 # ============================================================
-# 5. 持仓状态
+# 持仓
 # ============================================================
 @dataclass
 class Position:
@@ -289,19 +251,13 @@ class Position:
     entry_mult: float = 0.0
     partial_exits: List[dict] = field(default_factory=list)
 
-    # -------- 复盘用 --------
     entry_signal: dict = field(default_factory=dict)
     entry_ctx: dict = field(default_factory=dict)
     stop_history: List[dict] = field(default_factory=list)
 
-    # -------- 准确计算平均出场价 --------
     total_exit_amount: float = 0.0
     total_exit_shares: float = 0.0
-
-    # -------- 连续掉队天数 --------
     dropout_days: int = 0
-
-    # -------- 保本标志 --------
     breakeven_activated: bool = False
 
     def __post_init__(self):
@@ -310,7 +266,7 @@ class Position:
 
 
 # ============================================================
-# 6. 池化回测主循环
+# 回测主循环
 # ============================================================
 def backtest_pool(
     data_dict: Dict[str, pd.DataFrame],
@@ -334,7 +290,7 @@ def backtest_pool(
     logger.info(f"回测开始 | 初始权益={initial_equity:,.0f}")
     logger.info(f"日志目录: {run_dir.resolve()}")
 
-    # ---------- 预处理 ----------
+    # ---------- 预处理（仅补上游可能缺失的列） ----------
     prepared: Dict[str, pd.DataFrame] = {}
     for sym, df in data_dict.items():
         d = df.copy()
@@ -350,18 +306,13 @@ def backtest_pool(
             d["ATR_PCT_MA20"] = np.nan
         prepared[sym] = d
 
-    # 大盘过滤准备
-    market_ok = {}
+    # ---------- 大盘过滤：只记录"允许日期集合" ----------
+    market_ok_dates: Optional[set] = None
     if market_df is not None and not market_df.empty:
         m = market_df.copy()
         m["MA60"] = m["close"].rolling(60).mean()
-        m["market_ok"] = (m["close"] > m["MA60"]) & (m["MA60"].diff() > 0)
-        for date, row in m.iterrows():
-            market_ok[date] = bool(row["market_ok"])
-    else:
-        for df in prepared.values():
-            for date in df.index:
-                market_ok[date] = True
+        ok = (m["close"] > m["MA60"]) & (m["MA60"].diff() > 0)
+        market_ok_dates = set(m.index[ok.fillna(False)])
 
     all_dates = sorted(set().union(*[set(df.index) for df in prepared.values()]))
 
@@ -374,10 +325,8 @@ def backtest_pool(
     equity_curve: List[dict] = []
 
     last_rebalance_week = None
-
-    # 回撤控制状态
     peak_equity = float(initial_equity)
-    drawdown_block_until_idx = -1   # 在该 idx 之前不开新仓
+    drawdown_block_until_idx = -1
 
     # ---------- 内部工具 ----------
     def _loc(df: pd.DataFrame, date) -> Optional[int]:
@@ -392,13 +341,19 @@ def backtest_pool(
         except Exception:
             return default
 
+    def _calc_equity() -> float:
+        mv = sum(
+            pos.shares *
+            (last_close[sym] if not pd.isna(last_close[sym]) else pos.entry_price)
+            for sym, pos in positions.items()
+        )
+        return cash + mv
+
     def _current_total_risk() -> float:
-        """当前持仓的总风险敞口（按 entry-stop 计算，忽略负值）。"""
-        total = 0.0
-        for pos in positions.values():
-            risk_per_share = max(0.0, pos.entry_price - pos.stop)
-            total += risk_per_share * pos.shares
-        return total
+        return sum(
+            max(0.0, pos.entry_price - pos.stop) * pos.shares
+            for pos in positions.values()
+        )
 
     def _exec_exit(sym: str, date, price: float, reason: str) -> None:
         nonlocal cash
@@ -407,7 +362,6 @@ def backtest_pool(
         fee = gross * cfg.commission
         cash += gross - fee
         pos.realized_pnl += (price - pos.entry_price) * pos.shares - fee
-
         pos.total_exit_amount += gross
         pos.total_exit_shares += pos.shares
 
@@ -435,17 +389,14 @@ def backtest_pool(
             "entry_mult": pos.entry_mult,
             "r_per_share": pos.r_per_share,
             "tp_taken": len(pos.tp_taken),
-
             **{f"in_{k}": v for k, v in pos.entry_signal.items()},
             **{f"ctx_{k}": v for k, v in pos.entry_ctx.items()},
-
             "exit_open": _safe_float(row["open"]) if row is not None else None,
             "exit_high": _safe_float(row["high"]) if row is not None else None,
             "exit_low": _safe_float(row["low"]) if row is not None else None,
             "exit_close": _safe_float(row["close"]) if row is not None else None,
             "exit_fee": fee,
             "high_water": pos.high_water,
-
             "stop_history": json.dumps(pos.stop_history, default=str,
                                        ensure_ascii=False),
             "partial_exits": json.dumps(pos.partial_exits, default=str,
@@ -453,18 +404,10 @@ def backtest_pool(
         })
 
         recorder.log(
-            "CLOSE",
-            symbol=sym, date=str(date),
-            price=float(price), reason=reason,
-            shares_remaining=float(pos.shares),
-            initial_shares=float(pos.initial_shares),
-            pnl=float(pos.realized_pnl),
-            bars_held=pos.bars_held,
-            entry_price=pos.entry_price,
-            entry_date=str(pos.entry_date),
+            "CLOSE", symbol=sym, date=str(date), price=float(price),
+            reason=reason, pnl=float(pos.realized_pnl),
+            bars_held=pos.bars_held, entry_price=pos.entry_price,
             high_water=pos.high_water,
-            partial_exits=pos.partial_exits,
-            stop_history=pos.stop_history,
         )
         logger.info(
             f"[CLOSE] {sym} @{price:.3f} 原因={reason} "
@@ -478,20 +421,13 @@ def backtest_pool(
     for idx, date in enumerate(all_dates):
         reject_log: List[dict] = []
 
-        # ---------- 每日开始：更新回撤状态 ----------
-        mv_prev = sum(
-            pos.shares *
-            (last_close[sym] if not pd.isna(last_close[sym])
-             else pos.entry_price)
-            for sym, pos in positions.items()
-        )
-        current_equity = cash + mv_prev
+        # ---------- 回撤状态 ----------
+        current_equity = _calc_equity()
         if current_equity > peak_equity:
             peak_equity = current_equity
         current_dd = ((peak_equity - current_equity) / peak_equity
                       if peak_equity > 0 else 0.0)
 
-        # 回撤触发停开仓
         if current_dd >= cfg.drawdown_stop_threshold:
             new_block_until = idx + cfg.drawdown_stop_days
             if new_block_until > drawdown_block_until_idx:
@@ -503,24 +439,27 @@ def backtest_pool(
                 )
 
         is_drawdown_blocked = idx < drawdown_block_until_idx
-        # 回撤 ≥ 10% 时新仓规模减半
         size_scale = (cfg.drawdown_halve_mult
                       if current_dd >= cfg.drawdown_halve_threshold else 1.0)
 
-        # 冷却期递减
+        # ---------- 冷却期递减 ----------
         for sym in cooldowns:
             if cooldowns[sym] > 0:
                 cooldowns[sym] -= 1
 
-        # 判断是否为每周调仓日
-        current_week = (date.year, date.isocalendar()[1])
-        if last_rebalance_week is None or current_week != last_rebalance_week:
-            is_rebalance_day = True
-            last_rebalance_week = current_week
+        # ---------- 调仓日 ----------
+        if cfg.rebalance_weekly:
+            current_week = (date.year, date.isocalendar()[1])
+            if last_rebalance_week is None or current_week != last_rebalance_week:
+                is_rebalance_day = True
+                last_rebalance_week = current_week
+            else:
+                is_rebalance_day = False
         else:
-            is_rebalance_day = False
+            is_rebalance_day = True
 
-        is_market_ok = market_ok.get(date, True)
+        # ---------- 市场状态 ----------
+        is_market_ok = (market_ok_dates is None) or (date in market_ok_dates)
         if not is_market_ok:
             logger.info(f"市场状态不佳，暂停开仓: {date}")
 
@@ -551,33 +490,23 @@ def backtest_pool(
             if pd.isna(atr_s) or atr_s <= 0:
                 reject_log.append({
                     "symbol": s, "date": str(date),
-                    "reason": "invalid_atr", "atr": float(atr_s)
-                    if not pd.isna(atr_s) else None,
+                    "reason": "invalid_atr",
                 })
                 continue
             if pd.isna(atr_pct) or atr_pct < 1.0 or atr_pct > 8.0:
                 reject_log.append({
                     "symbol": s, "date": str(date),
-                    "reason": "atr_pct_out_of_range", "atr_pct": float(atr_pct)
-                    if not pd.isna(atr_pct) else None,
+                    "reason": "atr_pct_out_of_range",
+                    "atr_pct": float(atr_pct),
                 })
                 continue
-            big_smooth = prev_s.get("BIG_SCORE_SMOOTH", 0)
-            small_smooth = prev_s.get("SMALL_SCORE_SMOOTH", 0)
+            # 趋势过滤集中在 signal_multiplier 完成，此处只需补充 ADX 门槛
             adx = prev_s.get("ADX", np.nan)
-            if not ((big_smooth >= 2 and small_smooth >= 0) or
-                    (big_smooth >= 0 and small_smooth >= 2)):
-                reject_log.append({
-                    "symbol": s, "date": str(date),
-                    "reason": "trend_filter", "big": float(big_smooth),
-                    "small": float(small_smooth),
-                })
-                continue
             if pd.isna(adx) or adx < 20:
                 reject_log.append({
                     "symbol": s, "date": str(date),
-                    "reason": "adx_too_low", "adx": float(adx)
-                    if not pd.isna(adx) else None,
+                    "reason": "adx_too_low",
+                    "adx": None if pd.isna(adx) else float(adx),
                 })
                 continue
 
@@ -589,7 +518,7 @@ def backtest_pool(
         top_set = set(ranked[:cfg.top_n])
 
         # ----------------------------------------------------
-        # (A) 已有持仓管理
+        # (A) 持仓管理
         # ----------------------------------------------------
         for sym in list(positions.keys()):
             df = prepared[sym]
@@ -607,11 +536,8 @@ def backtest_pool(
             if cfg.log_position_daily:
                 recorder.log(
                     "POS_DAILY", symbol=sym, date=str(date),
-                    close=float(row["close"]),
-                    stop=pos.stop, high_water=pos.high_water,
-                    shares=float(pos.shares),
-                    unrealized_R=((float(row["close"]) - pos.entry_price)
-                                  / pos.r_per_share) if pos.r_per_share else None,
+                    close=float(row["close"]), stop=pos.stop,
+                    high_water=pos.high_water, shares=float(pos.shares),
                 )
 
             # ① 止损
@@ -649,9 +575,8 @@ def backtest_pool(
                     "date": str(date), "price": float(fill),
                     "shares": float(sell), "reason": f"tp_{r_mult}R",
                     "remaining": float(pos.shares),
-                    "R_multiple": float((fill - pos.entry_price)
-                                        / pos.r_per_share)
-                    if pos.r_per_share else None,
+                    "R_multiple": (float((fill - pos.entry_price) / R)
+                                   if R else None),
                 })
                 recorder.log(
                     "TP", symbol=sym, date=str(date),
@@ -698,20 +623,19 @@ def backtest_pool(
                                "dropout")
                     continue
 
-            # ⑤ 收盘后更新保本 / 移动 / 技术止损
+            # ⑤ 止损更新
             atr_now = prev["ATR"] if not pd.isna(prev["ATR"]) else pos.entry_atr
             old_stop = pos.stop
 
-            # 保本止损
             if (not pos.breakeven_activated and
                     pos.high_water >= pos.entry_price + cfg.breakeven_activate_R * R):
                 pos.breakeven_activated = True
                 if pos.s_trail is None or pos.s_trail < pos.entry_price:
                     pos.s_trail = pos.entry_price
                     recorder.log("BREAKEVEN", symbol=sym, date=str(date),
-                                 high_water=pos.high_water, entry=pos.entry_price)
+                                 high_water=pos.high_water,
+                                 entry=pos.entry_price)
 
-            # 移动止损
             if pos.high_water >= pos.entry_price + cfg.trail_activate_R * R:
                 new_trail = pos.high_water - cfg.trail_atr_mult * atr_now
                 if pos.s_trail is None or new_trail > pos.s_trail:
@@ -750,35 +674,31 @@ def backtest_pool(
                 )
 
         # ----------------------------------------------------
-        # (B) 横截面建仓（仅每周调仓日）
+        # (B) 建仓
         # ----------------------------------------------------
         slots = cfg.top_n - len(positions)
         new_positions_today = 0
         if slots > 0 and is_market_ok and is_rebalance_day and not is_drawdown_blocked:
-            total_eq = cash + sum(
-                positions[s].shares *
-                (last_close[s] if not pd.isna(last_close[s])
-                 else positions[s].entry_price)
-                for s in positions
-            )
+            total_eq = _calc_equity()
 
-            # 剩余总风险预算
             current_risk = _current_total_risk()
             remaining_risk_budget = max(
-                0.0,
-                total_eq * cfg.max_total_risk_pct - current_risk
+                0.0, total_eq * cfg.max_total_risk_pct - current_risk
             )
 
             for rank_idx, sym in enumerate(ranked, start=1):
-                if slots <= 0 or new_positions_today >= cfg.max_new_positions_per_day:
+                if (slots <= 0 or
+                        new_positions_today >= cfg.max_new_positions_per_day):
                     break
                 if sym in positions:
+                    continue
+                # 修复：当天被卖出的股票可能仍在 ranked 中，需再查冷却期
+                if cooldowns.get(sym, 0) > 0:
                     continue
                 if remaining_risk_budget <= 0:
                     reject_log.append({
                         "symbol": sym, "date": str(date),
                         "reason": "total_risk_limit_reached",
-                        "remaining_risk_budget": float(remaining_risk_budget),
                     })
                     break
 
@@ -790,16 +710,15 @@ def backtest_pool(
                 entry = float(row["open"]) * (1 + cfg.slippage)
                 support = prev.get("SUPPORT_1", np.nan)
 
-                # 动态止损乘数
                 atr_pct = prev.get("ATR_PCT", np.nan)
                 atr_pct_ma20 = prev.get("ATR_PCT_MA20", np.nan)
                 if (not pd.isna(atr_pct) and not pd.isna(atr_pct_ma20)
                         and atr_pct_ma20 > 0):
-                    dynamic_mult = np.clip(
+                    dynamic_mult = float(np.clip(
                         atr_pct / atr_pct_ma20,
                         cfg.dynamic_stop_min_mult,
                         cfg.dynamic_stop_max_mult,
-                    )
+                    ))
                 else:
                     dynamic_mult = 1.0
 
@@ -808,24 +727,21 @@ def backtest_pool(
                 stop = effective_stop(entry, atr_prev,
                                       s_init, s_hard, s_tech, None, cfg)
 
-                # 计算仓位：传入 size_scale（回撤减半）
                 shares, r_share, risk_budget = compute_position_size(
                     total_eq, entry, stop, m, cfg, size_scale=size_scale)
 
-                # 受剩余总风险预算约束
+                # 剩余总风险约束
                 if r_share > 0:
                     max_shares_by_risk = int(
                         remaining_risk_budget / r_share // cfg.lot_size
                     ) * cfg.lot_size
-                    if max_shares_by_risk < shares:
-                        shares = max_shares_by_risk
+                    shares = min(shares, max_shares_by_risk)
 
-                # 受单票最大仓位与现金约束
-                cap_shares_by_position = int(
+                # 单票上限 & 现金约束
+                cap_shares = int(
                     total_eq * cfg.max_position_pct / entry // cfg.lot_size
                 ) * cfg.lot_size
-                shares = min(shares, cap_shares_by_position)
-
+                shares = min(shares, cap_shares)
                 max_sh = int((cash * cfg.cash_buffer)
                              // (entry * cfg.lot_size)) * cfg.lot_size
                 shares = min(shares, max_sh)
@@ -839,8 +755,6 @@ def backtest_pool(
                         "reason": "size_too_small",
                         "mult": float(m), "entry": entry, "stop": stop,
                         "shares_raw": int(shares),
-                        "cash": float(cash), "total_eq": float(total_eq),
-                        "size_scale": float(size_scale),
                     })
                     continue
                 if cost + fee > cash:
@@ -851,13 +765,9 @@ def backtest_pool(
                     })
                     continue
 
-                # ---- 正式建仓 ----
                 cash_before = cash
                 cash -= (cost + fee)
-
-                # 更新剩余风险预算
-                new_risk = max(0.0, entry - stop) * shares
-                remaining_risk_budget -= new_risk
+                remaining_risk_budget -= max(0.0, entry - stop) * shares
 
                 signal_snapshot = {
                     "BIG_SCORE": _safe_float(prev.get("BIG_SCORE", 0), 0.0),
@@ -869,8 +779,7 @@ def backtest_pool(
                     "BREAK_SCORE": int(prev.get("BREAK_SCORE", 0) or 0),
                     "TOP_WARN": bool(prev.get("TOP_WARN", False)),
                     "BOTTOM_WARN": bool(prev.get("BOTTOM_WARN", False)),
-                    "support": (float(support)
-                                if not pd.isna(support) else None),
+                    "support": (float(support) if not pd.isna(support) else None),
                     "ATR_prev": atr_prev,
                     "dynamic_mult": float(dynamic_mult),
                     "multiplier": float(m),
@@ -882,18 +791,13 @@ def backtest_pool(
                     "risk_budget": float(risk_budget),
                     "size_scale": float(size_scale),
                     "current_dd": float(current_dd),
-                    "cap_shares": int(cap_shares_by_position),
-                    "cash_cap_shares": int(max_sh),
                     "final_shares": int(shares),
                     "entry_price": float(entry),
                     "s_init": float(s_init),
                     "s_hard": float(s_hard),
-                    "s_tech": (float(s_tech)
-                               if s_tech is not None else None),
+                    "s_tech": (float(s_tech) if s_tech is not None else None),
                     "stop_effective": float(stop),
                     "r_per_share": float(r_share),
-                    "slippage_paid": float(float(row["open"])
-                                           * cfg.slippage * shares),
                     "fee_paid": float(fee),
                 }
 
@@ -915,24 +819,22 @@ def backtest_pool(
                              **signal_snapshot, **ctx_snapshot)
                 logger.info(
                     f"[OPEN] {sym} @{entry:.3f} 股数={int(shares)} "
-                    f"止损={stop:.3f} 排名#{rank_idx} "
-                    f"mult={m:.2f} size_scale={size_scale:.2f} "
-                    f"风险预算={risk_budget:,.0f} 剩余风险预算={remaining_risk_budget:,.0f}"
+                    f"止损={stop:.3f} 排名#{rank_idx} mult={m:.2f} "
+                    f"size_scale={size_scale:.2f} 风险预算={risk_budget:,.0f}"
                 )
 
         # ----------------------------------------------------
-        # (C) 记录被拒的候选
+        # (C) 记录被拒候选
         # ----------------------------------------------------
         for r in reject_log:
             recorder.log("REJECT", **r)
 
         # ----------------------------------------------------
-        # (E) 记录组合净值
+        # (E) 记录净值
         # ----------------------------------------------------
         mv = sum(
             pos.shares *
-            (last_close[sym] if not pd.isna(last_close[sym])
-             else pos.entry_price)
+            (last_close[sym] if not pd.isna(last_close[sym]) else pos.entry_price)
             for sym, pos in positions.items()
         )
         equity_curve.append({
@@ -956,7 +858,7 @@ def backtest_pool(
                         for s in ranked[:cfg.top_n]],
         )
 
-    # ---------- 收尾 ----------
+    # ---------- 收尾：强制平仓 ----------
     for sym in list(positions.keys()):
         df = prepared[sym]
         _exec_exit(sym, df.index[-1],
@@ -974,14 +876,15 @@ def backtest_pool(
         f"最终权益 {equity_df['equity'].iloc[-1]:,.0f}"
     )
     if not trades_df.empty:
-        logger.info(f"离场原因分布: {trades_df['reason'].value_counts().to_dict()}")
+        logger.info(f"离场原因分布: "
+                    f"{trades_df['reason'].value_counts().to_dict()}")
 
     recorder.close()
     return trades_df, equity_df
 
 
 # ============================================================
-# 7. 回测报告
+# 报告
 # ============================================================
 def report(trades: pd.DataFrame, equity: pd.DataFrame,
            initial_equity: float) -> dict:
@@ -1020,13 +923,10 @@ def report(trades: pd.DataFrame, equity: pd.DataFrame,
         metrics = dict(
             total_return=total_return, annual_return=annual,
             max_drawdown=max_dd, sharpe=sharpe,
-            n_trades=len(trades),
-            win_rate=win_rate,
+            n_trades=len(trades), win_rate=win_rate,
             avg_win=avg_win, avg_loss=avg_loss,
-            profit_factor=profit_factor,
-            expectancy=expectancy,
-            avg_hold_bars=avg_hold,
-            avg_entry_mult=avg_mult,
+            profit_factor=profit_factor, expectancy=expectancy,
+            avg_hold_bars=avg_hold, avg_entry_mult=avg_mult,
         )
 
     print("=" * 62)
@@ -1042,11 +942,6 @@ def report(trades: pd.DataFrame, equity: pd.DataFrame,
         print(f"  单笔期望    : {metrics['expectancy']:,.0f}")
         print(f"  平均持仓    : {metrics['avg_hold_bars']:.1f} 根K线")
         print(f"  平均仓位乘数: {metrics['avg_entry_mult']:.2f}")
-        print("-" * 62)
-        print("【离场原因分布】")
-        for reason, cnt in trades["reason"].value_counts().items():
-            sub = trades[trades["reason"] == reason]
-            print(f"  {reason:<22} {cnt:>3} 笔   平均盈亏 {sub['pnl'].mean():>+10,.0f}")
     print("=" * 62)
     return metrics
 
@@ -1058,6 +953,12 @@ def pool_report(trades: pd.DataFrame, equity: pd.DataFrame,
     if trades.empty:
         return metrics
 
+    print("\n【离场原因分布】")
+    for reason, cnt in trades["reason"].value_counts().items():
+        sub = trades[trades["reason"] == reason]
+        print(f"  {reason:<22} {cnt:>3} 笔   "
+              f"平均盈亏 {sub['pnl'].mean():>+10,.0f}")
+
     print("\n【分股票贡献】")
     by_sym = (trades.groupby("symbol")
                     .agg(n=("pnl", "size"),
@@ -1068,16 +969,11 @@ def pool_report(trades: pd.DataFrame, equity: pd.DataFrame,
         print(f"  {sym:<10} {int(r['n']):>3}笔  "
               f"PnL {r['pnl']:>+12,.0f}  胜率 {r['win']*100:>5.1f}%")
 
-    print("\n【离场原因分布】")
-    for reason, cnt in trades["reason"].value_counts().items():
-        sub = trades[trades["reason"] == reason]
-        print(f"  {reason:<22} {cnt:>3} 笔   平均盈亏 {sub['pnl'].mean():>+10,.0f}")
-
     return metrics
 
 
 # ============================================================
-# 8. 使用示例
+# 使用示例
 # ============================================================
 if __name__ == "__main__":
     import sys
@@ -1086,7 +982,10 @@ if __name__ == "__main__":
     project_root = _P(__file__).resolve().parent.parent
     sys.path.insert(0, str(project_root))
 
-    from strategy.tech_analysis import get_stock_data, compute_trend
+    try:
+        from strategy.tech_analysis import get_stock_data, compute_trend
+    except ImportError:
+        from tech_analysis import get_stock_data, compute_trend
 
     data_dict = {
         "sh.600584": compute_trend(get_stock_data("test_data/data_sh.600584_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
@@ -1097,31 +996,25 @@ if __name__ == "__main__":
         "sh.688525": compute_trend(get_stock_data("test_data/data_sh.688525_stock_price.csv"), adx_threshold=20, adx_mode="shrink"),
     }
 
-    market_df = None  # 可传入大盘数据，例如沪深300指数
+    market_df = None
 
     cfg = PositionConfig(
-        # 池化
         top_n=5,
-        min_mult=0.50,                    # 提高到 0.5
-        # 风险预算
-        base_risk_pct=0.01,               # 降至 1%
+        min_mult=0.50,
+        base_risk_pct=0.01,
         max_position_pct=0.20,
-        max_total_risk_pct=0.06,          # 总风险敞口上限 6%
-        # 回撤控制
+        max_total_risk_pct=0.06,
         drawdown_halve_threshold=0.10,
         drawdown_halve_mult=0.5,
         drawdown_stop_threshold=0.20,
         drawdown_stop_days=5,
-        # 止损
         cooldown_bars=10,
         init_atr_mult=3.5,
         trail_atr_mult=2.5,
         trail_activate_R=3.0,
         hard_max_loss_pct=0.10,
         breakeven_activate_R=2.0,
-        # 止盈
         tp_levels=((1.5, 0.20), (3.0, 0.30)),
-        # 离场
         exit_on_dropout=True,
         dropout_buffer=4,
         max_new_positions_per_day=1,
