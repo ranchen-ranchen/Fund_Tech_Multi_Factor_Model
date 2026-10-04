@@ -56,7 +56,8 @@ def prep_periods(df: pd.DataFrame):
     return periods
 
 periods = prep_periods(df)
-run_backtest(periods)
+run_backtest(periods, align="outer", plot=True, benchmark_file="hs300etf_510300_performance.csv")
+
 
 
 

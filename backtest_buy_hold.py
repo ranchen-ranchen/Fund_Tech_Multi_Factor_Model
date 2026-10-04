@@ -2,11 +2,13 @@
 一揽子股票长期持有（等权重/自定义权重）回测程序 —— 支持多时间段
 
 用法:
-    python buy_and_hold_backtest.py a.csv b.csv c.csv      # 单时间段
-    python buy_and_hold_backtest.py                         # 无参数时用模拟数据演示（多时间段）
+    python backtest_buy_hold.py a.csv b.csv c.csv      # 单时间段
+    python backtest_buy_hold.py                         # 无参数时用模拟数据演示（多时间段）
 
 输入: 一系列股票 K 线 CSV 文件（需包含日期列与收盘价列）
+      可选基准文件 hs300etf_510300_performance.csv
 输出: portfolio_backtest.log 日志文件
+      portfolio_nav.png      净值曲线图（总资产净值 + 基准）
 """
 
 import os
@@ -18,13 +20,14 @@ from typing import List, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 
+
 # -----------------------------------------------------------------------------
 # 日志配置
 # -----------------------------------------------------------------------------
 def setup_logger(log_file: str = "portfolio_backtest.log") -> logging.Logger:
     logger = logging.getLogger("portfolio")
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()          # 防止重复添加 handler
+    logger.handlers.clear()
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
@@ -86,6 +89,147 @@ def load_stock_data(csv_path: str) -> pd.Series:
 
 
 # -----------------------------------------------------------------------------
+# 读取基准数据（hs300etf_510300_performance.csv）
+# -----------------------------------------------------------------------------
+def load_benchmark_data(csv_path: str) -> pd.Series:
+    """
+    读取基准 CSV（如 hs300etf_510300_performance.csv），
+    返回以日期为索引的累计净值 Series。
+    文件格式：前面是 Performance Summary，之后是 '# Daily Series'，
+    随后是列名行（,Close,Cumulative NAV,Drawdown）和每日数据。
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"找不到基准文件: {csv_path}")
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("# Daily Series"):
+            start_idx = i
+            break
+    if start_idx is None:
+        raise ValueError(f"{csv_path} 中未找到 '# Daily Series' 部分")
+
+    # 跳过 '# Daily Series' 行及其之前的所有行，下一行作为列名
+    df = pd.read_csv(csv_path, skiprows=start_idx + 1, encoding="utf-8-sig")
+    # 列名可能为 ['Unnamed: 0', 'Close', 'Cumulative NAV', 'Drawdown']
+    if df.shape[1] < 3:
+        raise ValueError(f"{csv_path} 数据列不足")
+
+    df = df.iloc[:, [0, 2]].copy()          # 日期列、累计净值列
+    df.columns = ["date", "nav"]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    df = (df.dropna()
+            .sort_values("date")
+            .drop_duplicates("date")
+            .set_index("date"))
+    return df["nav"]
+
+
+# -----------------------------------------------------------------------------
+# 可视化：总资产净值 + 基准
+# -----------------------------------------------------------------------------
+def plot_nav(
+    nav_total: pd.Series,
+    output_path: str = "portfolio_nav.png",
+    dpi: int = 120,
+    period_ranges: Optional[List[Dict[str, Any]]] = None,
+    benchmark_nav: Optional[pd.Series] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[str]:
+    """
+    绘制组合总资产净值随时间变化的曲线，可叠加基准净值。
+
+    参数
+    ----
+    nav_total     : 组合总净值 Series（索引为日期）
+    output_path   : 输出图片路径
+    dpi           : 图像分辨率
+    period_ranges : 时间段配置列表，每个元素包含 'name' / 'start' / 'end'。
+                    用于绘制交替背景阴影和分界线；为 None 时忽略。
+    benchmark_nav : 基准净值 Series（索引为日期），为 None 时不绘制。
+    logger        : 可选日志对象
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        msg = "未安装 matplotlib，跳过绘图（pip install matplotlib 后可启用）"
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
+
+    # 中文字体兼容
+    plt.rcParams["font.sans-serif"] = [
+        "SimHei", "Microsoft YaHei", "PingFang SC",
+        "Noto Sans CJK SC", "Arial Unicode MS", "DejaVu Sans",
+    ]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # ---- 时间段交替背景阴影 ----
+    if period_ranges:
+        for pi, pr in enumerate(period_ranges):
+            if pi % 2 == 1:
+                s_ = pd.to_datetime(pr["start"])
+                e_ = pd.to_datetime(pr["end"])
+                ax.axvspan(s_, e_, color="gray", alpha=0.06, zorder=0)
+
+    # ---- 总净值曲线 ----
+    idx  = nav_total.index
+    vals = nav_total.values
+
+    ax.plot(idx, vals, color="black", linewidth=2.0, label="TOTAL NAV")
+    ax.fill_between(idx, 1.0, vals, where=(vals >= 1.0),
+                    color="green", alpha=0.12, interpolate=True)
+    ax.fill_between(idx, 1.0, vals, where=(vals < 1.0),
+                    color="red", alpha=0.12, interpolate=True)
+    ax.axhline(y=1.0, color="gray", linestyle="--", linewidth=0.8)
+
+    # ---- 基准净值曲线 ----
+    if benchmark_nav is not None and not benchmark_nav.empty:
+        ax.plot(benchmark_nav.index, benchmark_nav.values,
+                color="blue", linewidth=1.5, linestyle="--",
+                label="HS300 ETF (510300)")
+
+    # ---- 时间段分界线 ----
+    if period_ranges:
+        for pi, pr in enumerate(period_ranges, 1):
+            if pi > 1:
+                bd = pd.to_datetime(pr["start"])
+                ax.axvline(x=bd, color="gray", linestyle="--",
+                           linewidth=0.7, alpha=0.5)
+
+    ax.set_ylabel("Cumulative NAV")
+    ax.set_xlabel("Date")
+    ax.set_title("Total Portfolio NAV vs Benchmark", fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    # 日期格式优化
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
+    fig.autofmt_xdate(rotation=30)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+    if logger:
+        logger.info(f"净值曲线图已保存至：{os.path.abspath(output_path)}")
+    return output_path
+
+
+# -----------------------------------------------------------------------------
 # 核心回测（多时间段）
 # -----------------------------------------------------------------------------
 def run_backtest(
@@ -93,6 +237,9 @@ def run_backtest(
     initial_capital: float = 1.0,
     log_file: str = "portfolio_backtest.log",
     align: str = "inner",
+    plot: bool = True,
+    plot_file: str = "portfolio_nav.png",
+    benchmark_file: Optional[str] = None,
 ):
     """
     参数
@@ -106,6 +253,9 @@ def run_backtest(
     initial_capital : 初始资金
     log_file        : 日志文件路径
     align           : 'inner' 取共同交易日；'outer' 取并集并前后向填充
+    plot            : 是否绘制净值曲线图
+    plot_file       : 净值曲线图输出路径
+    benchmark_file  : 基准 CSV 文件路径（如 hs300etf_510300_performance.csv）
 
     每个时间段结束时，将其期末净值作为下一时间段的期初净值，
     从而得到跨越多个时间段、连续变化的资产净值曲线。
@@ -128,7 +278,7 @@ def run_backtest(
         if "csv_files" not in p or not p["csv_files"]:
             raise ValueError(f"时间段 {k} 缺少 'csv_files' 或列表为空")
 
-    cumulative_nav = 1.0          # 上一时间段结束时的累计净值
+    cumulative_nav = 1.0
     last_date: Optional[pd.Timestamp] = None
     total_nav_parts: List[pd.DataFrame] = []
     period_overview: List[Dict[str, Any]] = []
@@ -163,6 +313,8 @@ def run_backtest(
                 raise ValueError(
                     f"时间段 {k}: 权重个数({len(weights)})与股票个数({n})不一致"
                 )
+            if any(w < 0 for w in weights):
+                raise ValueError(f"时间段 {k}: 权重不能为负数")
             total_w = float(sum(weights))
             if total_w <= 0:
                 raise ValueError(f"时间段 {k}: 权重之和必须大于 0")
@@ -173,6 +325,8 @@ def run_backtest(
         names, series_list = [], []
         for i, path in enumerate(csv_files):
             name = os.path.splitext(os.path.basename(path))[0]
+            if name in names:
+                name = f"{name}_{i+1}"
             try:
                 s = load_stock_data(path)
             except Exception as e:
@@ -192,7 +346,8 @@ def run_backtest(
         if align == "inner":
             prices = prices.dropna(how="any")
         else:
-            prices = prices.sort_index().ffill().bfill()
+            # outer：仅前向填充，避免 bfill 引入前视偏差
+            prices = prices.sort_index().ffill()
 
         if prices.empty:
             logger.error(f"  时间段 {k} 对齐后没有可用的交易日期，跳过")
@@ -235,27 +390,15 @@ def run_backtest(
         # ---- 每日市值 ----
         values = prices.mul(shares, axis=1)          # 各股票市值
         total  = values.sum(axis=1)                  # 组合总市值
+        abs_nav = total.div(initial_capital)         # 组合累计净值（跨周期连续）
 
-        # 以 initial_capital 为单位的“绝对累计净值贡献”
-        # sum_i values_i(t) / initial_capital == cumulative_nav(t)
-        stock_nav = values.div(initial_capital)
-        abs_nav   = total.div(initial_capital)       # 组合累计净值（跨周期连续）
-
-        # ---- 输出每日净值明细 ----
+        # ---- 输出每日净值明细（仅 TOTAL） ----
         logger.info("")
-        logger.info(f"  每日净值明细（累计净值，期初 = {cumulative_nav:.4f}）")
-        hdr = (f"  {'日期':<12s}"
-               + "".join(f"{nm[:11]:>13s}" for nm in names)
-               + f"{'TOTAL':>13s}")
-        logger.info(hdr)
-        logger.info("  " + "-" * (len(hdr) - 2))
-
-        for date in stock_nav.index:
-            line = f"  {date.strftime('%Y-%m-%d'):<12s}"
-            for nm in names:
-                line += f"{float(stock_nav.at[date, nm]):>13.4f}"
-            line += f"{float(abs_nav.at[date]):>13.4f}"
-            logger.info(line)
+        logger.info(f"  每日总净值明细（期初 = {cumulative_nav:.4f}）")
+        logger.info(f"  {'日期':<12s}{'TOTAL':>13s}")
+        logger.info("  " + "-" * 27)
+        for date in abs_nav.index:
+            logger.info(f"  {date.strftime('%Y-%m-%d'):<12s}{float(abs_nav.at[date]):>13.4f}")
 
         # ---- 记录该时间段数据，供合并 ----
         total_nav_parts.append(pd.DataFrame({"TOTAL": abs_nav}))
@@ -348,6 +491,76 @@ def run_backtest(
 
     logger.info(f"回测区间     : {s.index.min().date()} ~ {s.index.max().date()}")
     logger.info(f"总交易日数   : {len(s)}")
+
+    # =========================================================================
+    # 基准数据加载、对齐与统计
+    # =========================================================================
+    benchmark_aligned = None
+    if benchmark_file:
+        try:
+            benchmark_nav = load_benchmark_data(benchmark_file)
+            logger.info("")
+            logger.info("=" * 78)
+            logger.info(f"基准数据已加载：{benchmark_file}，共 {len(benchmark_nav)} 条")
+            logger.info(f"基准原始区间 : {benchmark_nav.index.min().date()} ~ {benchmark_nav.index.max().date()}")
+            logger.info("=" * 78)
+
+            # 对齐到组合的日期索引（前向填充）
+            benchmark_aligned = benchmark_nav.reindex(s.index).ffill()
+            # 若开头仍有缺失，用后向填充补齐（仅影响开头极少数点）
+            if benchmark_aligned.isna().any():
+                benchmark_aligned = benchmark_aligned.bfill()
+
+            if benchmark_aligned.notna().any():
+                b = benchmark_aligned.dropna()
+                if len(b) > 0:
+                    b_final = float(b.iloc[-1])
+                    b_start = float(b.iloc[0])
+                    b_total_ret = b_final / b_start - 1.0
+                    b_days = (b.index[-1] - b.index[0]).days
+                    b_years = b_days / 365.25 if b_days > 0 else 1.0
+                    b_ann_ret = (b_final ** (1 / b_years) - 1) if (b_years > 0 and b_final > 0) else 0.0
+                    b_cummax = b.cummax()
+                    b_dd = (b - b_cummax) / b_cummax
+                    b_max_dd = float(b_dd.min())
+                    b_daily_ret = b.pct_change().dropna()
+                    b_ann_vol = float(b_daily_ret.std() * np.sqrt(252)) if len(b_daily_ret) > 1 else 0.0
+                    b_sharpe = b_ann_ret / b_ann_vol if b_ann_vol > 0 else 0.0
+
+                    logger.info("")
+                    logger.info("=" * 78)
+                    logger.info("基准（HS300 ETF 510300）业绩汇总（与组合同区间）")
+                    logger.info("=" * 78)
+                    logger.info(f"基准区间     : {b.index.min().date()} ~ {b.index.max().date()}")
+                    logger.info(f"基准交易日数 : {len(b)}")
+                    logger.info(header)
+                    logger.info("-" * 90)
+                    logger.info(
+                        f"{'BENCHMARK':<18s}{b_final:>11.4f}{b_total_ret*100:>11.2f}%"
+                        f"{b_ann_ret*100:>11.2f}%{b_max_dd*100:>11.2f}%"
+                        f"{b_ann_vol*100:>11.2f}%{b_sharpe:>10.4f}"
+                    )
+                    logger.info("-" * 90)
+            else:
+                logger.warning("基准数据与组合日期无重叠，无法计算基准指标")
+                benchmark_aligned = None
+        except Exception as e:
+            logger.warning(f"加载基准数据失败：{e}，将不绘制基准曲线")
+            benchmark_aligned = None
+
+    # ---- 可视化 ----
+    if plot:
+        try:
+            plot_nav(
+                nav_total=s,
+                output_path=plot_file,
+                period_ranges=period_overview,
+                benchmark_nav=benchmark_aligned,
+                logger=logger,
+            )
+        except Exception as e:
+            logger.warning(f"绘制净值曲线图失败：{e}")
+
     logger.info(f"回测结束，日志已保存至：{os.path.abspath(log_file)}")
     logger.info("=" * 78)
 
@@ -370,9 +583,15 @@ def run_backtest(
 def _make_demo_files() -> List[str]:
     np.random.seed(42)
     dates = pd.bdate_range("2020-01-01", "2024-12-31")
-    specs = [("STOCK_A", 0.0006, 0.015),
-             ("STOCK_B", 0.0003, 0.020),
-             ("STOCK_C", 0.0004, 0.018)]
+    specs = [
+        ("STOCK_A", 0.0006, 0.015),
+        ("STOCK_B", 0.0003, 0.020),
+        ("STOCK_C", 0.0004, 0.018),
+        ("STOCK_D", 0.0005, 0.016),
+        ("STOCK_E", 0.0002, 0.022),
+        ("STOCK_F", 0.0007, 0.017),
+        ("STOCK_G", 0.0001, 0.019),
+    ]
     files = []
     for name, mu, sigma in specs:
         rets   = np.random.normal(mu, sigma, len(dates))
@@ -397,7 +616,6 @@ def _make_demo_files() -> List[str]:
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        # 命令行传参：单时间段，所有 csv 等权
         csv_files = sys.argv[1:]
         periods = [
             {
@@ -410,27 +628,27 @@ if __name__ == "__main__":
         ]
     else:
         print("未提供 csv 文件，使用模拟数据演示多时间段回测...")
-        demo_files = _make_demo_files()      # [STOCK_A, STOCK_B, STOCK_C]
+        demo_files = _make_demo_files()
 
         periods = [
             {
-                "name":       "第一阶段 A+B+C",
-                "csv_files":  demo_files,           # 三只股票
-                "weights":    [0.4, 0.3, 0.3],      # 自定义权重
+                "name":       "第一阶段 A+B+C+D+E",
+                "csv_files":  demo_files[:5],
+                "weights":    [0.3, 0.25, 0.2, 0.15, 0.1],
                 "start_date": "2020-01-01",
                 "end_date":   "2021-12-31",
             },
             {
-                "name":       "第二阶段 A+B",
-                "csv_files":  demo_files[:2],       # 换成 A、B 两只
-                "weights":    [0.5, 0.5],
+                "name":       "第二阶段 A+C+F+G",
+                "csv_files":  [demo_files[0], demo_files[2], demo_files[5], demo_files[6]],
+                "weights":    [0.4, 0.3, 0.2, 0.1],
                 "start_date": "2022-01-01",
                 "end_date":   "2023-06-30",
             },
             {
-                "name":       "第三阶段 B+C",
-                "csv_files":  demo_files[1:],       # 换成 B、C 两只
-                "weights":    None,                 # 等权
+                "name":       "第三阶段 B+C+F",
+                "csv_files":  [demo_files[1], demo_files[2], demo_files[5]],
+                "weights":    None,
                 "start_date": "2023-07-01",
                 "end_date":   "2024-12-31",
             },
@@ -441,4 +659,7 @@ if __name__ == "__main__":
         initial_capital=1.0,
         log_file="portfolio_backtest.log",
         align="inner",
+        plot=True,                     # 是否输出净值图
+        plot_file="portfolio_nav.png", # 输出图片路径
+        benchmark_file="hs300etf_510300_performance.csv",  # 基准文件
     )
