@@ -1,6 +1,6 @@
 """
 fetch_daily_k.py
-基于 baostock 批量获取 A 股日 K 线数据（前复权）
+基于 baostock 批量获取 A 股日 K 线数据
 
 特性：
     - 断点续传：以 out_dir/individual/*.csv 作为缓存，重启自动跳过已抓取标的
@@ -20,6 +20,8 @@ fetch_daily_k.py
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 import time
 from typing import List, Optional
 
@@ -64,40 +66,9 @@ OUT_COLS = ["date", "code", "open", "high", "low", "close", "preclose",
 # ----------------------------------------------------------------------
 # 代码规范化
 # ----------------------------------------------------------------------
-def normalize_code(code: str) -> str:
-    """
-    将各种写法的股票代码统一为 baostock 要求的格式：sh.600000 / sz.000001 / bj.430047
-    """
-    raw = str(code).strip().lower().replace(" ", "")
-    if not raw:
-        raise ValueError("股票代码为空")
-
-    if "." in raw:
-        parts = raw.split(".")
-        if len(parts) != 2:
-            raise ValueError(f"无法识别的股票代码: {code}")
-        a, b = parts
-        if a in ("sh", "sz", "bj"):
-            return f"{a}.{b}"
-        if b in ("sh", "sz", "bj"):
-            return f"{b}.{a}"
-        raise ValueError(f"无法识别的股票代码: {code}")
-
-    for pre in ("sh", "sz", "bj"):
-        if raw.startswith(pre) and raw[2:].isdigit():
-            return f"{pre}.{raw[2:]}"
-
-    if not raw.isdigit():
-        raise ValueError(f"无法识别的股票代码: {code}")
-
-    if raw.startswith(("60", "68", "51", "58", "11", "90", "50")):
-        return f"sh.{raw}"
-    if raw.startswith(("00", "30", "12", "15", "16", "18", "20", "39", "13")):
-        return f"sz.{raw}"
-    if raw.startswith(("43", "83", "87", "88", "92")):
-        return f"bj.{raw}"
-
-    return f"sh.{raw}" if raw[0] in ("5", "6", "9") else f"sz.{raw}"
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+from utils.text_utils import normalize_code 
 
 
 # ----------------------------------------------------------------------
