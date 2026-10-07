@@ -9,7 +9,7 @@
 # )
 
 from utils.text_utils import read_hs300_constituents, read_business_description
-from strategy.industry_chain_classifier import is_ai_compute_or_new_energy
+from strategy.industry_chain_classifier import is_ai_compute
 target_code_dict = {}
 for date in ['2021-01-01', 
              '2021-06-30', '2021-12-31',
@@ -21,7 +21,7 @@ for date in ['2021-01-01',
     target_code = ""
     for code in hs300_code_list:
         des = read_business_description(stock_code = code, csv_path = 'data/stock_main_business/main_business.csv')
-        if is_ai_compute_or_new_energy(business_description=des):
+        if is_ai_compute(business_description=des):
             target_code = target_code + code + " "
     target_code_dict[date] = target_code
 import csv
