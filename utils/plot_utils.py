@@ -7,10 +7,77 @@ from datetime import datetime, timedelta
 import calendar
 import time
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+
+def plot_clustered_bars(data, output_path=None):
+    """
+    Visualize data as a clustered bar chart using seaborn.
+
+    Parameters
+    ----------
+    data : list of list
+        Nested list with 10 groups, each group containing 5 values.
+        Shape must be (10, 5): 10 clusters, 5 bars per cluster.
+    output_path : str, optional
+        If given, the figure is saved to this path.
+    """
+    arr = np.asarray(data, dtype=float)
+    if arr.ndim != 2 or arr.shape != (10, 5):
+        raise ValueError(
+            f"Expected data with shape (10, 5), got {arr.shape}"
+        )
+
+    n_clusters, n_series = arr.shape
+
+    # Build a long-format DataFrame, which is the natural input for seaborn.
+    df = pd.DataFrame(
+        {
+            "Periods": np.repeat(
+                [f"P{i + 1}" for i in range(n_clusters)], n_series
+            ),
+            "Series": np.tile(['size', 'value', 'momentum', 'volatility', 'total'], n_clusters),
+            "Value": arr.reshape(-1),
+        }
+    )
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    sns.barplot(
+        data=df,
+        x="Periods",
+        y="Value",
+        hue="Series",
+        palette="muted",
+        edgecolor="black",
+        linewidth=0.6,
+        ax=ax,
+    )
+
+    ax.set_title("Factor contributions in 10 periods", fontsize=14)
+    ax.set_xlabel("Periods")
+    ax.set_ylabel("Value")
+    ax.legend(title="Factor contrib", ncol=n_series, loc="upper right")
+
+    # Annotate each bar with its value.
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.2f", fontsize=7, padding=2)
+
+    fig.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+
+    plt.show()
+    return fig, ax
+
+
+
+
 
 def plot_heatmap(code, data, x_ticks, y_ticks):
-    import seaborn as sns
-    import matplotlib.pyplot as plt
     img_name = 'ror_sens_{0:}.png'.format(code)
     # 1. 构造数据
     df = pd.DataFrame(data, index=y_ticks, columns=x_ticks)
@@ -36,8 +103,6 @@ def plot_heatmap(code, data, x_ticks, y_ticks):
 
 
 def plot_k_line(df, mid, upper, lower, code):
-    import seaborn as sns
-    import matplotlib.pyplot as plt
     from mplfinance.original_flavor import candlestick_ohlc
     import matplotlib.dates as mdates
     # 设置绘图风格

@@ -142,8 +142,8 @@ def _load_cached(path: str) -> Optional[pd.DataFrame]:
 def fetch_one(bs_code: str,
               start_date: str,
               end_date: str,
+              adjustflag: str,
               frequency: str = FREQUENCY,
-              adjustflag: str = ADJUST_FLAG,
               max_retry: int = MAX_RETRY) -> pd.DataFrame:
     last_err: Optional[Exception] = None
 
@@ -213,6 +213,7 @@ def _clean(df: pd.DataFrame, bs_code: str) -> pd.DataFrame:
 # 批量获取（★ 支持断点续传）
 # ----------------------------------------------------------------------
 def get_daily_data(codes: List[str],
+                   adjustflag: str = ADJUST_FLAG,
                    start_date: str = START_DATE,
                    end_date: str = END_DATE,
                    out_dir: str = OUT_DIR,
@@ -271,7 +272,7 @@ def get_daily_data(codes: List[str],
             # ---------- ② 走网络抓取 ----------
             print(f"[{i}/{total}] [fetch] {bs_code} ...", end=" ", flush=True)
             try:
-                df = fetch_one(bs_code, start_date, end_date)
+                df = fetch_one(bs_code, start_date, end_date, adjustflag)
             except Exception as e:  # noqa: BLE001
                 print(f"失败: {e}")
                 failed.append(bs_code)
