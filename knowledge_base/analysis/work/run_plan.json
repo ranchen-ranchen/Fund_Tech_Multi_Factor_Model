@@ -1,0 +1,67 @@
+{
+  "framework": "/home/omen/work/quant/knowledge_base/industry_eval_prompt.md",
+  "chains": [
+    "新能源车链",
+    "风光储能与新型电力系统链",
+    "AI 算力/半导体/数据中心链",
+    "军工科技链",
+    "生物科技链",
+    "工业软件与智能制造链",
+    "元宇宙与 VR/AR 链",
+    "信创与数字经济链",
+    "商业航天链",
+    "传统能源与资源品链",
+    "种业与养殖链",
+    "互联网链",
+    "房地产链"
+  ],
+  "conditions": [
+    "技术拐点",
+    "政策背书",
+    "未商业化",
+    "大空间"
+  ],
+  "as_of": "2020-12-31",
+  "files": [
+    {
+      "name": "2015_events.md",
+      "year": 2015,
+      "chars": 72386,
+      "chunks": 1
+    },
+    {
+      "name": "2016_events.md",
+      "year": 2016,
+      "chars": 68943,
+      "chunks": 1
+    },
+    {
+      "name": "2017_events.md",
+      "year": 2017,
+      "chars": 59373,
+      "chunks": 1
+    },
+    {
+      "name": "2018_events.md",
+      "year": 2018,
+      "chars": 61097,
+      "chunks": 1
+    },
+    {
+      "name": "2019_events.md",
+      "year": 2019,
+      "chars": 65486,
+      "chunks": 1
+    },
+    {
+      "name": "2020_events.md",
+      "year": 2020,
+      "chars": 65083,
+      "chunks": 1
+    }
+  ],
+  "total_chunks": 6,
+  "chunk_chars": 80000,
+  "prompts_dir": "/home/omen/work/quant/knowledge_base/analysis/work/prompts",
+  "report_path": "/home/omen/work/quant/knowledge_base/analysis/industry_eval_report.md"
+}

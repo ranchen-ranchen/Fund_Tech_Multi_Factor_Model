@@ -1,24 +1,68 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 CSI 300 ETF (510300) Buy-and-Hold Performance Analysis
 Data source: akshare (East Money)
 Adjustment: back-adjusted (hfq)
-Holding period: 2021-01-01 to 2026-01-01
+
+测试区间固定为 2021-01-01 至运行脚本当天（不晚于 2026-12-31），
+不支持自定义起止日期。
+
+用法示例
+--------
+# 默认：510300，2021-01-01 至今，后复权
+python eval_hs300_perform.py
+
+# 更换标的、复权方式、无风险利率
+python eval_hs300_perform.py -s 159919 --adjust qfq --rf 0.015
+
+# 保存图表但不弹窗显示（服务器/无显示器环境使用）
+python eval_hs300_perform.py --no-show
 """
+
+import argparse
+from datetime import datetime
 
 import akshare as ak
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.pyplot as plt
+
 matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
+
+DEFAULT_SYMBOL = "510300"
+TEST_START = "20210101"        # 固定测试起始日期（YYYYMMDD）
+TEST_END_LIMIT = "20261231"    # 结束日期上限（YYYYMMDD）
+DEFAULT_RF = 0.02
+ADJUST_CHOICES = {"hfq": "hfq", "qfq": "qfq", "none": ""}
+ADJUST_LABELS = {"hfq": "hfq (back-adjusted)",
+                 "qfq": "qfq (forward-adjusted)",
+                 "none": "none (unadjusted)"}
 
 
 # ==================== 1. Data Fetching ====================
 
-def fetch_etf_data(symbol: str = "510300",
-                   start_date: str = "20210101",
-                   end_date: str = "20260101",
+def get_test_period() -> tuple[str, str]:
+    """
+    返回固定的测试起止日期（YYYYMMDD）。
+
+    起始日期固定为 2021-01-01；结束日期为运行脚本的当天，
+    但不晚于 2026-12-31。
+    """
+    today = datetime.today().strftime("%Y%m%d")
+    end_date = min(today, TEST_END_LIMIT)
+    if end_date < TEST_START:
+        raise RuntimeError(
+            f"系统日期 {today} 早于固定起始日期 {TEST_START}，无法运行测试。"
+        )
+    return TEST_START, end_date
+
+
+def fetch_etf_data(symbol: str = DEFAULT_SYMBOL,
+                   start_date: str = TEST_START,
+                   end_date: str | None = None,
                    adjust: str = "hfq") -> pd.DataFrame:
     """
     从 akshare 获取 ETF 后复权日K数据。
@@ -28,7 +72,8 @@ def fetch_etf_data(symbol: str = "510300",
     symbol : str
         ETF 代码，沪深300ETF为 "510300"
     start_date, end_date : str
-        日期范围，格式 "YYYYMMDD"
+        日期范围，格式 "YYYYMMDD"，应来自 get_test_period()；
+        end_date 为 None 时取今天（不晚于 2026-12-31）
     adjust : str
         复权方式："hfq"=后复权, "qfq"=前复权, ""=不复权
 
@@ -36,6 +81,9 @@ def fetch_etf_data(symbol: str = "510300",
     -------
     pd.DataFrame，索引为日期，含列 open/close/high/low/volume/amount 等
     """
+    if end_date is None:
+        end_date = get_test_period()[1]
+
     print(f"Fetching back-adjusted daily data for {symbol} ({start_date} ~ {end_date}) ...")
 
     df = ak.fund_etf_hist_em(
@@ -49,7 +97,7 @@ def fetch_etf_data(symbol: str = "510300",
     if df is None or df.empty:
         raise RuntimeError(
             f"akshare returned no data for {symbol}. "
-            f"Please check the symbol and date range."
+            f"Please check the symbol and date range ({start_date} ~ {end_date})."
         )
 
     # Data cleaning
@@ -86,7 +134,7 @@ def fetch_etf_data(symbol: str = "510300",
 # ==================== 2. Performance Metrics ====================
 
 def calc_performance_metrics(close: pd.Series,
-                             rf_annual: float = 0.02,
+                             rf_annual: float = DEFAULT_RF,
                              trading_days: int = 252) -> dict:
     """
     基于后复权收盘价序列计算买入持有策略的绩效指标。
@@ -104,6 +152,9 @@ def calc_performance_metrics(close: pd.Series,
     -------
     dict
     """
+    if len(close) < 2:
+        raise ValueError("价格序列不足两个交易日，无法计算收益指标。")
+
     # ---- Daily returns ----
     daily_ret = close.pct_change().dropna()
 
@@ -161,7 +212,8 @@ def calc_performance_metrics(close: pd.Series,
 def save_report_to_csv(metrics: dict,
                        df: pd.DataFrame,
                        symbol: str,
-                       csv_path: str = None) -> str:
+                       csv_path: str = None,
+                       adjust: str = "hfq") -> str:
     """
     将绩效报告保存为 CSV 文件。
 
@@ -174,24 +226,29 @@ def save_report_to_csv(metrics: dict,
     symbol : str
         ETF 代码，用于默认文件名
     csv_path : str, optional
-        输出路径，默认 "hs300etf_{symbol}_performance.csv"
+        输出路径，默认 "hs300etf_{symbol}_{start}_{end}_performance.csv"
+    adjust : str
+        复权方式，写入报告
 
     Returns
     -------
     str : 实际保存路径
     """
-    if csv_path is None:
-        csv_path = f"hs300etf_{symbol}_performance.csv"
-
     start_date = df.index[0].date().isoformat()
     end_date = df.index[-1].date().isoformat()
+
+    if csv_path is None:
+        csv_path = (
+            f"hs300etf_{symbol}_{df.index[0]:%Y%m%d}_{df.index[-1]:%Y%m%d}"
+            f"_performance.csv"
+        )
 
     # Scalar metrics table
     summary_rows = [
         ("Symbol", symbol),
         ("Start Date", start_date),
         ("End Date", end_date),
-        ("Adjustment", "hfq (back-adjusted)"),
+        ("Adjustment", ADJUST_LABELS.get(adjust, adjust)),
         ("Initial Price", f"{metrics['Initial Price']:.4f}"),
         ("Final Price", f"{metrics['Final Price']:.4f}"),
         ("Trading Days", metrics["Trading Days"]),
@@ -227,10 +284,19 @@ def save_report_to_csv(metrics: dict,
 
 # ==================== 3. Visualization ====================
 
-def plot_results(metrics: dict, symbol: str = "510300"):
+def plot_results(metrics: dict,
+                 symbol: str = DEFAULT_SYMBOL,
+                 save_path: str = None,
+                 show: bool = True):
     """绘制净值曲线与回撤曲线。"""
     cum = metrics["Cumulative NAV"]
     dd = metrics["Drawdown Series"]
+
+    if save_path is None:
+        save_path = (
+            f"hs300etf_{symbol}_{cum.index[0]:%Y%m%d}_{cum.index[-1]:%Y%m%d}"
+            f"_performance.png"
+        )
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True,
                              gridspec_kw={"height_ratios": [2, 1]})
@@ -239,8 +305,11 @@ def plot_results(metrics: dict, symbol: str = "510300"):
     axes[0].plot(cum.index, cum.values, color="#1f77b4", linewidth=1.5)
     axes[0].axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
     axes[0].set_ylabel("Cumulative NAV")
-    axes[0].set_title(f"CSI 300 ETF ({symbol}) Buy-and-Hold NAV (Back-Adjusted)",
-                      fontsize=13, fontweight="bold")
+    axes[0].set_title(
+        f"CSI 300 ETF ({symbol}) Buy-and-Hold NAV (Back-Adjusted)\n"
+        f"{cum.index[0].date()} ~ {cum.index[-1].date()}",
+        fontsize=13, fontweight="bold",
+    )
     axes[0].grid(alpha=0.3)
 
     # Drawdown
@@ -252,28 +321,77 @@ def plot_results(metrics: dict, symbol: str = "510300"):
     axes[1].grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f"hs300etf_{symbol}_performance.png", dpi=150, bbox_inches="tight")
-    plt.show()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Chart saved to: {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
-# ==================== 4. Main ====================
+# ==================== 4. CLI ====================
 
-if __name__ == "__main__":
-    SYMBOL = "510300"
-    START = "20210101"
-    END = "20260101"
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="沪深300 ETF 买入持有绩效分析（数据源：akshare/东方财富）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-s", "--symbol", default=DEFAULT_SYMBOL,
+        help="ETF 代码",
+    )
+    parser.add_argument(
+        "-a", "--adjust", choices=sorted(ADJUST_CHOICES), default="hfq",
+        help="复权方式：hfq=后复权, qfq=前复权, none=不复权",
+    )
+    parser.add_argument(
+        "-r", "--rf", type=float, default=DEFAULT_RF,
+        metavar="RATE",
+        help="年化无风险利率（小数），用于夏普比率",
+    )
+    parser.add_argument(
+        "--csv", default=None, metavar="PATH",
+        help="CSV 输出路径（默认自动按标的+区间命名）",
+    )
+    parser.add_argument(
+        "--png", default=None, metavar="PATH",
+        help="图片输出路径（默认自动按标的+区间命名）",
+    )
+    parser.add_argument(
+        "--no-plot", action="store_true",
+        help="跳过绘图（只输出报告 CSV）",
+    )
+    parser.add_argument(
+        "--no-show", action="store_true",
+        help="保存图片但不弹窗显示（服务器/无显示器环境使用）",
+    )
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    symbol = args.symbol
+    start, end = get_test_period()
 
     # Fetch data
-    df = fetch_etf_data(SYMBOL, START, END, adjust="hfq")
+    df = fetch_etf_data(symbol, start, end, adjust=ADJUST_CHOICES[args.adjust])
 
     # Compute metrics
-    metrics = calc_performance_metrics(df["close"], rf_annual=0.02)
+    metrics = calc_performance_metrics(df["close"], rf_annual=args.rf)
+
+    actual_start, actual_end = df.index[0], df.index[-1]
+    if actual_start.strftime("%Y%m%d") != start or actual_end.strftime("%Y%m%d") != end:
+        print(f"Note: 实际数据区间为 {actual_start.date()} ~ {actual_end.date()}，"
+              f"与请求区间（{start} ~ {end}）不同（非交易日/数据边界）。\n")
 
     # Print report
     print("=" * 60)
-    print(f"  CSI 300 ETF ({SYMBOL}) Buy-and-Hold Performance Report")
-    print(f"  Holding period: {df.index[0].date()} to {df.index[-1].date()}")
-    print(f"  Adjustment: hfq (back-adjusted)")
+    print(f"  CSI 300 ETF ({symbol}) Buy-and-Hold Performance Report")
+    print(f"  Holding period: {actual_start.date()} to {actual_end.date()}")
+    print(f"  Adjustment: {ADJUST_LABELS[args.adjust]}")
     print("=" * 60)
     print(f"  Initial Price (hfq)     : {metrics['Initial Price']:.4f}")
     print(f"  Final Price (hfq)       : {metrics['Final Price']:.4f}")
@@ -282,7 +400,7 @@ if __name__ == "__main__":
     print(f"  Total Return            : {metrics['Total Return']:.2%}")
     print(f"  Annualized Return       : {metrics['Annualized Return']:.2%}")
     print(f"  Annualized Volatility   : {metrics['Annualized Volatility']:.2%}")
-    print(f"  Sharpe Ratio (rf=2%)    : {metrics['Sharpe Ratio']:.4f}")
+    print(f"  Sharpe Ratio (rf={args.rf:.1%}) : {metrics['Sharpe Ratio']:.4f}")
     print(f"  Max Drawdown            : {metrics['Max Drawdown']:.2%}")
     print(f"  Max Drawdown Period     : {metrics['Max Drawdown Start'].date()} "
           f"-> {metrics['Max Drawdown End'].date()}")
@@ -291,13 +409,18 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Save CSV report
-    save_report_to_csv(metrics, df, SYMBOL)
+    save_report_to_csv(metrics, df, symbol,
+                       csv_path=args.csv, adjust=args.adjust)
 
     # Plot
-    plot_results(metrics, SYMBOL)
+    if args.no_plot:
+        print("Skipped plotting (--no-plot).")
+    else:
+        plot_results(metrics, symbol,
+                     save_path=args.png, show=not args.no_show)
+
+    return 0
 
 
-
-
-
-    
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,4 +1,5 @@
 import re
+import numpy as np
 import pandas as pd
 
 import csv
@@ -142,12 +143,12 @@ def read_target_code_weight(csv_file_path):
     # 读取 CSV
     df = pd.read_csv(csv_file_path)
 
-    # 取前 10 行
-    first_ten = df.head(10)
+    ## 取前 10 行
+    # first_ten = df.head(10)
 
     result_dfs = []
 
-    for _, row in first_ten.iterrows():
+    for _, row in df.iterrows():
         # 拆分股票代码（去除空字符串，处理多余空格）
         codes = [c for c in str(row['target_code']).split() if c]
 
@@ -184,16 +185,26 @@ def query_pb_mrq(
     target_date_col: str = "target_date",
     actual_date_col: str = "actual_date",
     pb_col: str = "pbMRQ",
+    target_mode: str = "nearest",
 ) -> pd.DataFrame:
     """
-    从 CSV 中查询指定股票在给定日期下，target_date 最接近该日期的 pbMRQ。
-    所有股票使用同一个 target_date。
+    从 CSV 中查询指定股票在给定日期下的 pbMRQ。所有股票使用同一个 target_date。
+
+    target_mode:
+        - "nearest"（默认）：取 target_date 与查询日期绝对差最小的行（兼容旧行为）。
+        - "previous"：只取 target_date <= 查询日期的最近一行。
+        - "exact"：只取 target_date == 查询日期的行；找不到时 pbMRQ 为 NaN。
+    跨期归因应使用 "exact" 或 "previous"，避免取到未来数据。
 
     注意：匹配依据是 CSV 中的 target_date，actual_date 仅随匹配行返回，不参与比较。
 
     返回列：
         code, pbMRQ
     """
+    if target_mode not in ("nearest", "previous", "exact"):
+        raise ValueError(
+            f"target_mode 必须是 'nearest' / 'previous' / 'exact'，实际为 {target_mode!r}"
+        )
 
     # 1. 读取并规范化 CSV
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
@@ -224,10 +235,16 @@ def query_pb_mrq(
         # 关键改动 1：按 target_date 过滤，而不是 actual_date
         sub = df[(df["_code_key"] == key) & df[target_date_col].notna()].copy()
 
+        if pd.notna(target_ts):
+            if target_mode == "previous":
+                sub = sub[sub[target_date_col] <= target_ts]
+            elif target_mode == "exact":
+                sub = sub[sub[target_date_col] == target_ts]
+
         if sub.empty or pd.isna(target_ts):
             rows.append({
                 "query_code": str(qc),
-                "code": str(qc),
+                "code": key,
                 "query_date": target_ts,
                 "target_date": pd.NaT,
                 "actual_date": pd.NaT,
@@ -289,6 +306,34 @@ def read_business_description(
                 )
 
     return None
+
+
+def load_business_descriptions(csv_path: str = "main_business.csv") -> dict:
+    """
+    一次性读取主营业务 CSV，返回 {6位股票代码: 描述}。
+
+    描述拼接规则与 read_business_description 保持一致；
+    同一代码出现多行时保留第一行，与逐行查找的行为一致。
+    """
+    result = {}
+
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row_code = (row.get("股票代码") or "").strip()
+
+            row_match = re.search(r'(?<!\d)(\d{6})(?!\d)', row_code)
+            if not row_match:
+                continue
+
+            fields = ["主营业务", "产品类型", "产品名称", "经营范围"]
+            description = "；".join(
+                f"{field}：{(row.get(field) or '').strip()}"
+                for field in fields
+            )
+            result.setdefault(row_match.group(1), description)
+
+    return result
 
 
 

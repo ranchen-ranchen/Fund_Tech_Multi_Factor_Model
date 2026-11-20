@@ -18,6 +18,7 @@ def calc_excess_return_distribution(
     ax=None,
     return_df=False,
     verbose=True,
+    plot=True,
 ):
     """
     计算一组股票在 [start_date, end_date] 区间内相对基准的超额收益，
@@ -47,6 +48,8 @@ def calc_excess_return_distribution(
         为 True 时额外返回每只股票的收益明细 DataFrame。
     verbose : bool
         是否打印统计摘要。
+    plot : bool
+        是否绘制直方图；批量计算时可设为 False。
 
     返回
     -------
@@ -108,36 +111,38 @@ def calc_excess_return_distribution(
     if n_valid == 0:
         raise ValueError("没有任何股票在指定区间内获得有效收益率")
 
-    # ---------- 绘图 ----------
-    sns.set_theme(style="whitegrid", font_scale=1.0)
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
-
-    sns.histplot(
-        x=valid.values,
-        bins=bins,
-        kde=kde,
-        color="steelblue",
-        edgecolor="white",
-        alpha=0.85,
-        ax=ax,
-    )
-
     mean_, med_ = valid.mean(), valid.median()
-    ax.axvline(0, color="crimson", ls="--", lw=1.2, label="0")
-    ax.axvline(mean_, color="darkorange", ls="-", lw=1.5, label=f"mean = {mean_:.2%}")
-    ax.axvline(med_, color="seagreen", ls=":", lw=1.5, label=f"median = {med_:.2%}")
 
-    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
-    ax.set_xlabel("Excess return")
-    ax.set_ylabel("Number of stocks")
-    if title is None:
-        title = (
-            f"Cross-sectional distribution of excess return "
-            f"({start:%Y-%m-%d} ~ {end:%Y-%m-%d}, N={n_valid})"
+    # ---------- 绘图 ----------
+    if plot:
+        sns.set_theme(style="whitegrid", font_scale=1.0)
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+
+        sns.histplot(
+            x=valid.values,
+            bins=bins,
+            kde=kde,
+            color="steelblue",
+            edgecolor="white",
+            alpha=0.85,
+            ax=ax,
         )
-    ax.set_title(title)
-    ax.legend(loc="best", frameon=True)
+
+        ax.axvline(0, color="crimson", ls="--", lw=1.2, label="0")
+        ax.axvline(mean_, color="darkorange", ls="-", lw=1.5, label=f"mean = {mean_:.2%}")
+        ax.axvline(med_, color="seagreen", ls=":", lw=1.5, label=f"median = {med_:.2%}")
+
+        ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+        ax.set_xlabel("Excess return")
+        ax.set_ylabel("Number of stocks")
+        if title is None:
+            title = (
+                f"Cross-sectional distribution of excess return "
+                f"({start:%Y-%m-%d} ~ {end:%Y-%m-%d}, N={n_valid})"
+            )
+        ax.set_title(title)
+        ax.legend(loc="best", frameon=True)
 
     if verbose:
         print(f"有效股票数: {n_valid}/{n_total}，基准区间收益: {bench_ret:.2%}")

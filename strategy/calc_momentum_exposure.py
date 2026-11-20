@@ -27,6 +27,7 @@ def momentum_exposure_histogram(
     date_col="date",
     title=None,
     return_fig=False,
+    plot=True,
 ):
     """
     计算一系列个股在指定时间段内的动量因子暴露，横截面标准化后画直方图。
@@ -55,6 +56,8 @@ def momentum_exposure_histogram(
         图标题，缺省自动生成。
     return_fig : bool
         True 时返回 (结果 DataFrame, matplotlib Figure)。
+    plot : bool
+        是否绘制直方图；批量计算时可设为 False 以避免生成大量图形。
 
     Returns
     -------
@@ -136,48 +139,50 @@ def momentum_exposure_histogram(
     res["momentum_z"] = np.nan
     res.loc[valid_mask, "momentum_z"] = z.values
 
-    plot_df = res.dropna(subset=["momentum_z"]).copy()
+    fig = None
+    if plot:
+        plot_df = res.dropna(subset=["momentum_z"]).copy()
 
-    # ---------- 3. seaborn 直方图 ----------
-    fig, ax = plt.subplots(figsize=figsize)
-    use_kde = len(plot_df) >= 3
-    sns.histplot(
-        data=plot_df,
-        x="momentum_z",
-        bins=bins,
-        kde=use_kde,
-        color="steelblue",
-        edgecolor="white",
-        linewidth=0.6,
-        ax=ax,
-    )
+        # ---------- 3. seaborn 直方图 ----------
+        fig, ax = plt.subplots(figsize=figsize)
+        use_kde = len(plot_df) >= 3
+        sns.histplot(
+            data=plot_df,
+            x="momentum_z",
+            bins=bins,
+            kde=use_kde,
+            color="steelblue",
+            edgecolor="white",
+            linewidth=0.6,
+            ax=ax,
+        )
 
-    ax.axvline(0.0, color="crimson", linestyle="--", linewidth=1.2,
-               label="横截面均值 (z=0)")
+        ax.axvline(0.0, color="crimson", linestyle="--", linewidth=1.2,
+                   label="横截面均值 (z=0)")
 
-    # 标注关键统计量
-    stats_text = (
-        f"n = {len(plot_df)}\n"
-        f"mean = {plot_df['momentum_z'].mean():.3f}\n"
-        f"std  = {plot_df['momentum_z'].std(ddof=1):.3f}\n"
-        f"min  = {plot_df['momentum_z'].min():.3f}\n"
-        f"max  = {plot_df['momentum_z'].max():.3f}"
-    )
-    ax.text(
-        0.985, 0.97, stats_text,
-        transform=ax.transAxes,
-        ha="right", va="top", fontsize=9,
-        bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
-    )
+        # 标注关键统计量
+        stats_text = (
+            f"n = {len(plot_df)}\n"
+            f"mean = {plot_df['momentum_z'].mean():.3f}\n"
+            f"std  = {plot_df['momentum_z'].std(ddof=1):.3f}\n"
+            f"min  = {plot_df['momentum_z'].min():.3f}\n"
+            f"max  = {plot_df['momentum_z'].max():.3f}"
+        )
+        ax.text(
+            0.985, 0.97, stats_text,
+            transform=ax.transAxes,
+            ha="right", va="top", fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.85),
+        )
 
-    ax.set_xlabel("Standardized Momentum Exposure (z-score)")
-    ax.set_ylabel("Number of Stocks")
-    if title is None:
-        title = (f"Momentum Factor Exposure Distribution "
-                 f"({start.date()} ~ {end.date()}, n={len(plot_df)})")
-    ax.set_title(title)
-    ax.legend(loc="upper left")
-    plt.tight_layout()
+        ax.set_xlabel("Standardized Momentum Exposure (z-score)")
+        ax.set_ylabel("Number of Stocks")
+        if title is None:
+            title = (f"Momentum Factor Exposure Distribution "
+                     f"({start.date()} ~ {end.date()}, n={len(plot_df)})")
+        ax.set_title(title)
+        ax.legend(loc="upper left")
+        plt.tight_layout()
 
     if return_fig:
         return res, fig

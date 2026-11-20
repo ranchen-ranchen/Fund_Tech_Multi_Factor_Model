@@ -11,39 +11,70 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-def plot_clustered_bars(data, output_path=None):
+def plot_clustered_bars(data, output_path=None, periods=None, series=None,
+                        y_label="Value", bar_fmt="%.2f", title="Factor contributions"):
     """
     Visualize data as a clustered bar chart using seaborn.
 
     Parameters
     ----------
     data : list of list
-        Nested list with 10 groups, each group containing 5 values.
-        Shape must be (10, 5): 10 clusters, 5 bars per cluster.
+        Nested list with `n_clusters` rows and `n_series` columns.
     output_path : str, optional
         If given, the figure is saved to this path.
+    periods : list[str], optional
+        每个簇的标签，长度必须等于行数。缺省时：11 行使用 2021h1~2026h1，
+        其他行数使用 P1, P2, ...
+    series : list[str], optional
+        每个序列的标签，长度必须等于列数。缺省时：5 列使用
+        size/value/momentum/volatility/total，其他列数使用 S1, S2, ...
+    y_label : str
+        y 轴标题。
+    bar_fmt : str
+        柱顶数值格式。
+    title : str
+        图标题。
     """
     arr = np.asarray(data, dtype=float)
-    if arr.ndim != 2 or arr.shape != (10, 5):
-        raise ValueError(
-            f"Expected data with shape (10, 5), got {arr.shape}"
-        )
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2-D data, got shape {arr.shape}")
 
     n_clusters, n_series = arr.shape
+
+    if periods is None:
+        if n_clusters == 11:
+            periods = ['2021h1', '2021h2', '2022h1', '2022h2', '2023h1',
+                       '2023h2', '2024h1', '2024h2', '2025h1', '2025h2', '2026h1']
+        else:
+            periods = [f"P{i + 1}" for i in range(n_clusters)]
+    if series is None:
+        if n_series == 5:
+            series = ['size', 'value', 'momentum', 'volatility', 'total']
+        else:
+            series = [f"S{i + 1}" for i in range(n_series)]
+
+    periods = list(periods)
+    series = list(series)
+    if len(periods) != n_clusters:
+        raise ValueError(
+            f"periods 长度 {len(periods)} 与数据行数 {n_clusters} 不一致"
+        )
+    if len(series) != n_series:
+        raise ValueError(
+            f"series 长度 {len(series)} 与数据列数 {n_series} 不一致"
+        )
 
     # Build a long-format DataFrame, which is the natural input for seaborn.
     df = pd.DataFrame(
         {
-            "Periods": np.repeat(
-                [f"P{i + 1}" for i in range(n_clusters)], n_series
-            ),
-            "Series": np.tile(['size', 'value', 'momentum', 'volatility', 'total'], n_clusters),
+            "Periods": np.repeat(periods, n_series),
+            "Series": np.tile(series, n_clusters),
             "Value": arr.reshape(-1),
         }
     )
 
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(max(12, n_clusters * 1.1), 6))
 
     sns.barplot(
         data=df,
@@ -56,14 +87,14 @@ def plot_clustered_bars(data, output_path=None):
         ax=ax,
     )
 
-    ax.set_title("Factor contributions in 10 periods", fontsize=14)
+    ax.set_title(title, fontsize=14)
     ax.set_xlabel("Periods")
-    ax.set_ylabel("Value")
-    ax.legend(title="Factor contrib", ncol=n_series, loc="upper right")
+    ax.set_ylabel(y_label)
+    ax.legend(title="Factor contrib", ncol=min(n_series, 4), loc="upper right")
 
     # Annotate each bar with its value.
     for container in ax.containers:
-        ax.bar_label(container, fmt="%.2f", fontsize=7, padding=2)
+        ax.bar_label(container, fmt=bar_fmt, fontsize=7, padding=2)
 
     fig.tight_layout()
 
