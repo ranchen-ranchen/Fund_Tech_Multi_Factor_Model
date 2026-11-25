@@ -864,6 +864,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="年化无风险利率（小数），用于标准夏普；默认 0.02，与 eval_hs300_perform.py 一致",
     )
     parser.add_argument(
+        "--export-details", default=None, metavar="PATH",
+        help="可选：把逐期持仓、NAV 和摘要写成结构化 JSON，供只读看板使用",
+    )
+    parser.add_argument(
         "--weight-glob", default=WEIGHT_GLOB,
         help="沪深300权重 CSV 通配符；每个调仓日取上一期期末的持仓作为本期期初成分股",
     )
@@ -972,6 +976,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         benchmark_file=benchmark_file,
         log_file=DEFAULT_LOG_FILE,
         risk_free_rate=args.risk_free_rate,
+        details_file=args.export_details,
     )
 
     # 5) 可选：发布为 canonical 目标文件（仅在回测确实产生结果后）

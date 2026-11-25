@@ -231,3 +231,12 @@ stock_daily_k_bfq/
 group_return_analysis.csv
 group_return_analysis.md
 group_return_spread.png
+
+# Read-only dashboard
+web/data/*.json
+web/data/*.tmp
+web/.venv/
+
+# Dashboard source lives in web/lib; keep it despite the generic lib/ rule
+!web/lib/
+!web/lib/*.py

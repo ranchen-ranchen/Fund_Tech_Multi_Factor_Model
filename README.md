@@ -272,6 +272,7 @@ python target_code_pipeline.py --risk-free-rate 0.02   # standard Sharpe rf (def
 python target_code_pipeline.py --weight-glob 'data/hs300_weight_*h*.csv'
 python target_code_pipeline.py --business-csv data/stock_main_business/main_business.csv
 python target_code_pipeline.py --cache-file target_code_llm_cache.jsonl
+python target_code_pipeline.py --skip-prep --export-details web/data/backtest_details.json
 ```
 
 Run from the project root; all default paths are relative to it.
@@ -497,6 +498,7 @@ Weight files themselves have no downloader in this repository and must be suppli
 pip install pandas numpy matplotlib seaborn openai python-dotenv baostock akshare pytest
 # optional: pyarrow (Parquet output from fetch_daily_k)
 # optional: mplfinance (only for utils.plot_utils.plot_k_line)
+# optional read-only dashboard: see web/requirements.txt (streamlit, plotly)
 ```
 
 ### Environment file
@@ -580,6 +582,8 @@ The current test suite covers credential redaction (`test/test_security_utils.py
 | `knowledge_base/output/*_events.md` | `news_collect.py` | Yearly event cards, policy ledger, valuation snapshots |
 | `knowledge_base/analysis/industry_eval_report.md` | `industry_eval.py` | Four-condition screening report |
 | `knowledge_base/analysis/work/**` | `industry_eval.py` | Prompts, evidence cache, run plan |
+| `web/data/*.json` | `web/export_data.py` | Dashboard-ready JSON; gitignored and regenerated on demand |
+| `web/data/backtest_details.json` | `target_code_pipeline.py --export-details` | Structured NAV, period, holdings and summary data |
 
 Existing logs, charts and canonical target files are backed up with `.bak-<timestamp>` suffixes before being overwritten.
 
@@ -624,3 +628,44 @@ Existing logs, charts and canonical target files are backed up with `.bak-<times
 | Sharpe ratio (legacy CAGR/vol) | Geometric annualized return divided by annualized volatility; retained as `sharpe_cagr` |
 | 0→1 theme | A theme transitioning from technological possibility to commercialization |
 | As-of / point-in-time | Using only information that was publicly available at the stated date |
+
+---
+
+## 14. Read-Only Visualization Dashboard
+
+An optional local Streamlit dashboard renders the research artifacts. It is
+deliberately outside the research pipeline:
+
+- **read-only** — it never writes research files, runs a backtest or calls the LLM;
+- **local-only** — it binds to `127.0.0.1` and has no authentication;
+- **English UI** — source content such as stock names, LLM reasons and reports
+  remains in Chinese.
+
+The dashboard consumes a JSON dataset produced by `web/export_data.py`. The one
+structured input that does not exist by default is `web/data/backtest_details.json`;
+it is written by the pipeline when `--export-details` is supplied.
+
+Quick start from the project root:
+
+```bash
+pip install -r web/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+python target_code_pipeline.py --skip-prep --no-update-k \
+    --export-details web/data/backtest_details.json
+python web/export_data.py
+web/run.sh
+```
+
+Open <http://localhost:8502>. From a Windows browser under WSL2, use `localhost`
+rather than `127.0.0.1`; the Windows loopback interface may be owned by another
+service. The dashboard has six pages: portfolio overview, holdings and periods,
+factor attribution, AI vs non-AI group analysis, knowledge and selection, and
+data and methodology.
+
+Refresh workflow: re-run the relevant research script, rebuild the dataset with
+`python web/export_data.py`, then click **Reload data** in the sidebar. A full
+refresh sequence is documented in [web/README.md](web/README.md).
+
+Security: the app never reads the project `.env` file, never calls DeepSeek, and
+only reads allowlisted repository files. Do not change the bind address to
+`0.0.0.0` without adding authentication and HTTPS.

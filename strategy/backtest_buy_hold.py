@@ -29,12 +29,18 @@
 
 import os
 import sys
+import json
+import math
 import logging
 import tempfile
+from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
+
+
+DETAILS_SCHEMA_VERSION = 1
 
 
 # -----------------------------------------------------------------------------
@@ -461,6 +467,65 @@ def plot_nav(
 
 
 # -----------------------------------------------------------------------------
+# 结构化明细导出（供只读研究看板使用）
+# -----------------------------------------------------------------------------
+def _json_safe(value: Any) -> Any:
+    """把 pandas/numpy 标量转换成严格 JSON 可编码的值。
+
+    NaN / Inf 统一转成 None；Timestamp / date 转 ISO 字符串。
+    该函数只服务于可选的明细导出，不参与任何指标计算。
+    """
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, pd.Series):
+        return [_json_safe(v) for v in value.tolist()]
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, np.datetime64):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _write_details_json(path: str, payload: Dict[str, Any]) -> None:
+    """原子写入结构化明细 JSON。"""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = target + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_safe(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+    os.replace(tmp_path, target)
+
+
+# -----------------------------------------------------------------------------
 # 核心回测（多时间段 + 双边交易成本）
 # -----------------------------------------------------------------------------
 def run_backtest(
@@ -474,6 +539,7 @@ def run_backtest(
     log_daily_stock_nav: bool = True,
     cost_rate: float = 0.005,
     risk_free_rate: float = 0.02,
+    details_file: Optional[str] = None,
 ):
     """
     参数
@@ -499,6 +565,9 @@ def run_backtest(
                           eval_hs300_perform.py 的默认值一致。标准夏普使用
                           (算术年化收益 - risk_free_rate) / 年化波动；旧的
                           CAGR/波动口径作为 sharpe_cagr 保留用于对比。
+    details_file        : 可选的结构化明细 JSON 路径。提供时，在回测结束后
+                          额外写入逐期持仓、个股区间指标、NAV、回撤和基准
+                          对齐序列，供只读研究看板使用；不提供时行为不变。
     """
     if cost_rate < 0:
         raise ValueError("cost_rate 不能为负数")
@@ -737,12 +806,35 @@ def run_backtest(
         logger.info("  " + "-" * (len(hdr) - 2))
 
         stock_metrics_period: Dict[str, Dict[str, float]] = {}
+        holdings_rows: List[Dict[str, Any]] = []
+        entry_date = prices.index.min()
+        end_date = prices.index.max()
         for i, name in enumerate(names):
             s_nav = stock_nav[name].dropna()
             m = compute_stock_metrics(s_nav)
             stock_metrics_period[name] = m
 
             contrib = weights[i] * m["total_ret"]
+
+            code_parts = name.split("_")
+            code6 = (
+                code_parts[1]
+                if len(code_parts) >= 2 and code_parts[1].isdigit()
+                else None
+            )
+            holdings_rows.append({
+                "name":         name,
+                "code6":        code6,
+                "weight":       weights[i],
+                "entry_date":   entry_date,
+                "end_date":     end_date,
+                "entry_price":  float(p0.iloc[i]),
+                "end_price":    float(prices[name].iloc[-1]),
+                "amount":       amounts[i],
+                "shares":       shares[i],
+                **m,
+                "contrib":      contrib,
+            })
 
             logger.info(
                 f"  {name:<18s}"
@@ -815,6 +907,7 @@ def run_backtest(
             "start_nav":    period_start_nav,
             "end_nav":      period_end_nav,
             "return":       period_ret,
+            "holdings":     holdings_rows,
         })
 
         cumulative_nav = period_end_nav
@@ -1136,6 +1229,47 @@ def run_backtest(
         "total_cost":               total_cost_accum,
         "cost_rate":                cost_rate,
     }]
+
+    # ---- 可选：写入供只读看板使用的结构化明细 ----
+    if details_file:
+        details_payload = {
+            "schema_version": DETAILS_SCHEMA_VERSION,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "meta": {
+                "initial_capital": initial_capital,
+                "align": align,
+                "cost_rate": cost_rate,
+                "risk_free_rate": risk_free_rate,
+                "log_file": os.path.abspath(log_file),
+                "plot_file": os.path.abspath(plot_file),
+                "benchmark_file": (
+                    os.path.abspath(benchmark_file) if benchmark_file else None
+                ),
+                "n_periods": len(period_overview),
+            },
+            "summary": summary,
+            "nav": [{"date": idx, "nav": val} for idx, val in s.items()],
+            "drawdown": [{"date": idx, "drawdown": val} for idx, val in dd.items()],
+            "periods": period_overview,
+            "stock_overview": stock_overview_rows,
+            "benchmark": {
+                "file": (
+                    os.path.abspath(benchmark_file) if benchmark_file else None
+                ),
+                "aligned": (
+                    [{"date": idx, "nav": val} for idx, val in benchmark_aligned.items()]
+                    if benchmark_aligned is not None
+                    else []
+                ),
+            },
+        }
+        try:
+            _write_details_json(details_file, details_payload)
+            logger.info(
+                f"结构化明细已保存至：{os.path.abspath(details_file)}"
+            )
+        except Exception as e:
+            logger.warning(f"写入结构化明细失败：{e}")
 
     return nav, summary
 
