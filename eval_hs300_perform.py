@@ -151,6 +151,13 @@ def calc_performance_metrics(close: pd.Series,
     Returns
     -------
     dict
+
+    口径
+    ----
+    - Annualized Return 为几何 CAGR（首尾收盘价）。
+    - Sharpe Ratio 为标准的算术口径：
+          (mean(日收益) × trading_days - rf_annual) / 年化波动
+    - Sharpe Ratio (CAGR/vol) 为旧的 CAGR/vol 口径，仅用于对比。
     """
     if len(close) < 2:
         raise ValueError("价格序列不足两个交易日，无法计算收益指标。")
@@ -173,8 +180,20 @@ def calc_performance_metrics(close: pd.Series,
     # ---- Annualized volatility ----
     annual_vol = daily_ret.std() * np.sqrt(trading_days)
 
+    # ---- Arithmetic annualized return (standard Sharpe numerator) ----
+    annual_return_arith = (
+        float(daily_ret.mean() * trading_days) if len(daily_ret) > 0 else 0.0
+    )
+
     # ---- Sharpe ratio ----
-    sharpe = (annual_return - rf_annual) / annual_vol if annual_vol > 0 else 0.0
+    # 标准口径：算术年化收益 - rf，再除以年化波动。
+    # 旧口径（CAGR/vol）保留为 sharpe_cagr，仅用于对比。
+    sharpe_cagr = (
+        (annual_return - rf_annual) / annual_vol if annual_vol > 0 else 0.0
+    )
+    sharpe = (
+        (annual_return_arith - rf_annual) / annual_vol if annual_vol > 0 else 0.0
+    )
 
     # ---- Max drawdown ----
     running_max = cum_nav.cummax()
@@ -195,8 +214,10 @@ def calc_performance_metrics(close: pd.Series,
         "Trading Days": n_days,
         "Total Return": total_return,
         "Annualized Return": annual_return,
+        "Annualized Return (Arithmetic)": annual_return_arith,
         "Annualized Volatility": annual_vol,
         "Sharpe Ratio": sharpe,
+        "Sharpe Ratio (CAGR/vol)": sharpe_cagr,
         "Max Drawdown": max_dd,
         "Max Drawdown Start": dd_start_idx,
         "Max Drawdown End": dd_end_idx,
@@ -254,8 +275,10 @@ def save_report_to_csv(metrics: dict,
         ("Trading Days", metrics["Trading Days"]),
         ("Total Return", f"{metrics['Total Return']:.6f}"),
         ("Annualized Return", f"{metrics['Annualized Return']:.6f}"),
+        ("Annualized Return (Arithmetic)", f"{metrics['Annualized Return (Arithmetic)']:.6f}"),
         ("Annualized Volatility", f"{metrics['Annualized Volatility']:.6f}"),
         ("Sharpe Ratio", f"{metrics['Sharpe Ratio']:.6f}"),
+        ("Sharpe Ratio (CAGR/vol)", f"{metrics['Sharpe Ratio (CAGR/vol)']:.6f}"),
         ("Max Drawdown", f"{metrics['Max Drawdown']:.6f}"),
         ("Max Drawdown Start", metrics["Max Drawdown Start"].date().isoformat()),
         ("Max Drawdown End", metrics["Max Drawdown End"].date().isoformat()),
@@ -398,9 +421,11 @@ def main(argv=None) -> int:
     print(f"  Trading Days            : {metrics['Trading Days']}")
     print("-" * 60)
     print(f"  Total Return            : {metrics['Total Return']:.2%}")
-    print(f"  Annualized Return       : {metrics['Annualized Return']:.2%}")
+    print(f"  Annualized Return       : {metrics['Annualized Return']:.2%}  (CAGR)")
+    print(f"  Annualized Return (Arith) : {metrics['Annualized Return (Arithmetic)']:.2%}")
     print(f"  Annualized Volatility   : {metrics['Annualized Volatility']:.2%}")
-    print(f"  Sharpe Ratio (rf={args.rf:.1%}) : {metrics['Sharpe Ratio']:.4f}")
+    print(f"  Sharpe Ratio (arith, rf={args.rf:.1%}) : {metrics['Sharpe Ratio']:.4f}")
+    print(f"  Sharpe Ratio (CAGR/vol) : {metrics['Sharpe Ratio (CAGR/vol)']:.4f}  (legacy)")
     print(f"  Max Drawdown            : {metrics['Max Drawdown']:.2%}")
     print(f"  Max Drawdown Period     : {metrics['Max Drawdown Start'].date()} "
           f"-> {metrics['Max Drawdown End'].date()}")

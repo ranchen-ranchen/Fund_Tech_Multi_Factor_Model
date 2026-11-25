@@ -28,6 +28,7 @@ quant/
 ├── target_code_pipeline.py            # Workflow 1: selection + backtest orchestration
 ├── eval_hs300_perform.py              # Workflow 2: 510300 ETF benchmark report
 ├── barra_model_analysis.py            # Workflow 3: factor attribution
+├── group_return_analysis.py           # AI vs non-AI two-group period return diagnostic
 ├── strategy/
 │   ├── backtest_buy_hold.py           # Multi-period buy-and-hold engine (costs, benchmark, IR)
 │   ├── industry_chain_classifier.py   # DeepSeek AI-compute-chain classifier
@@ -58,9 +59,12 @@ quant/
 │   ├── industry_eval_prompt.md        # Four-condition screening framework
 │   ├── output/                        # Yearly event dossiers and quarterly splits
 │   └── analysis/                      # Evidence cache, prompts and final report
-├── test/                              # pytest tests (credential redaction)
+├── test/                              # pytest tests (redaction, metrics, group analysis)
 ├── portfolio_backtest.log             # Generated backtest log
 ├── portfolio_nav.png                  # Generated NAV chart
+├── group_return_analysis.csv          # Generated per-period group-return detail
+├── group_return_analysis.md           # Generated group-return summary and caveats
+├── group_return_spread.png            # Generated group-return chart
 ├── factor_contrib_detail.csv          # Generated factor attribution detail
 └── factor_contrib_barplot.png         # Generated factor contribution chart
 ```
@@ -231,13 +235,19 @@ Reported metrics:
 |---|---|
 | Final NAV | Ending net asset value, initial = 1.0 |
 | Total return | `final_nav - 1` |
-| Annualized return | Geometric, 252 trading days per year |
+| Annualized return | Geometric CAGR, 252 trading days per year |
+| Annualized return (arithmetic) | Mean daily return × 252 |
 | Annualized volatility | Daily return std × √252 |
-| Sharpe ratio | `annualized return / annualized volatility` (risk-free rate = 0 in this engine) |
+| Sharpe ratio (standard) | `(mean daily return × 252 − risk_free_rate) / annualized volatility`; default `risk_free_rate = 2%`, matching `eval_hs300_perform.py` |
+| Sharpe ratio (legacy CAGR/vol) | `annualized return / annualized volatility`; retained as `sharpe_cagr` for comparison |
 | Max drawdown | Minimum of `NAV / running max - 1` |
-| Active return | Mean daily portfolio-minus-benchmark return × 252 |
+| Active return (standard IR numerator) | Mean daily portfolio-minus-benchmark return × 252 (arithmetic) |
 | Tracking error | Std of daily excess return × √252 |
-| Information ratio | Active return / tracking error |
+| Information ratio (standard) | Active return / tracking error (arithmetic) |
+| Geometric excess return / relative CAGR | `((P_end/P_start) / (B_end/B_start))^(1/years) − 1`; display only, not the IR numerator |
+| CAGR difference | `portfolio_cagr − benchmark_cagr`; display only |
+
+The standard Sharpe and IR use arithmetic mean returns, while the annualized return display uses geometric CAGR. The legacy CAGR/vol Sharpe is retained as `sharpe_cagr`, and the geometric excess return is retained as `geometric_excess_return` / `relative_cagr`; neither is used as the IR numerator. The attribution in Workflow 3 remains arithmetic.
 
 The benchmark is loaded from `hs300etf_510300_*_performance.csv`. `resolve_benchmark` prefers an explicitly supplied `--benchmark` path, then the legacy `hs300etf_510300_performance.csv`, then the most recently modified matching file. Benchmark alignment uses **forward fill only**; backward fill was deliberately removed because it introduces look-ahead bias. Metrics are computed only on dates where both portfolio and benchmark are valid.
 
@@ -258,6 +268,7 @@ python target_code_pipeline.py --no-update-k    # offline / data already complet
 python target_code_pipeline.py --no-cache       # no disk cache; deduplicate within this run only
 python target_code_pipeline.py --refresh-cache  # ignore existing LLM cache and re-query
 python target_code_pipeline.py --benchmark path/to/benchmark.csv
+python target_code_pipeline.py --risk-free-rate 0.02   # standard Sharpe rf (default 2%)
 python target_code_pipeline.py --weight-glob 'data/hs300_weight_*h*.csv'
 python target_code_pipeline.py --business-csv data/stock_main_business/main_business.csv
 python target_code_pipeline.py --cache-file target_code_llm_cache.jsonl
@@ -273,6 +284,25 @@ Run from the project root; all default paths are relative to it.
 - API exceptions are re-raised with secrets redacted via `utils.security_utils.redact_secrets`.
 - The pipeline aborts rather than silently backfilling missing prices or empty selections.
 
+### 4.9 Two-group period return diagnostic
+
+`group_return_analysis.py` tests whether the LLM label sorts returns. For each semi-annual period it partitions the 300-name universe into the **AI group** (target codes) and the **non-AI group** (the rest), computes equal-weight gross hfq returns over the same effective boundaries as the backtest, and reports:
+
+- per-period means, medians, cap-weighted means, the full-universe equal-weight mean, and the 510300 ETF context;
+- the spread (AI − non-AI), Welch t / permutation p, bootstrap CI and coverage;
+- a period-level summary (mean/median spread, t-stat on the 12 period spreads, sign test, hit rate, bootstrap CI, cumulative long-short and cumulative group growth);
+- robustness windows: 2021–2024, 2025–2026 and ex-last-period.
+
+The AI group's equal-weight mean is the gross buy-and-hold portfolio return (before costs); the non-AI group is the "rest of the index" control. The analysis is **descriptive**: the labels use current business descriptions, are not point-in-time, and the theme was chosen with hindsight. The long-short spread is a factor return, not an investable A-share strategy. Cumulative figures are products of period returns and exclude the between-period gap days (the backtest buys at the next period's first close).
+
+```bash
+python group_return_analysis.py
+python group_return_analysis.py --end-date 2026-11-21
+python group_return_analysis.py --no-plot
+```
+
+Outputs: `group_return_analysis.csv` (per-period detail), `group_return_analysis.md` (summary + caveats) and `group_return_spread.png` (spread bars + cumulative growth).
+
 ---
 
 ## 5. Workflow 2 — 510300 ETF Benchmark Evaluation
@@ -284,7 +314,7 @@ Run from the project root; all default paths are relative to it.
 - Default adjustment: `hfq` (back-adjusted); supports `qfq` and unadjusted.
 - Suspended days (zero volume) are removed.
 
-Metrics: trading days, total return, annualized return (geometric), annualized volatility, Sharpe ratio with configurable annual risk-free rate (default 2%), max drawdown and its start/end dates, Calmar ratio, daily win rate, initial/final price.
+Metrics: trading days, total return, annualized return (geometric), annualized return (arithmetic), annualized volatility, standard arithmetic Sharpe ratio with configurable annual risk-free rate (default 2%), legacy CAGR/vol Sharpe for comparison, max drawdown and its start/end dates, Calmar ratio, daily win rate, initial/final price.
 
 Outputs default to `hs300etf_<symbol>_<start>_<end>_performance.csv` and `.png`. The CSV contains both the summary and daily series and is the benchmark input for Workflow 1.
 
@@ -528,7 +558,7 @@ Daily K-line caches are created and incrementally extended automatically by Work
 pytest
 ```
 
-The current test suite covers credential redaction and endpoint sanitization (`test/test_security_utils.py`).
+The current test suite covers credential redaction (`test/test_security_utils.py`), metric conventions (`test/test_backtest_metrics.py`) and the two-group analysis (`test/test_group_return_analysis.py`).
 
 ---
 
@@ -542,6 +572,9 @@ The current test suite covers credential redaction and endpoint sanitization (`t
 | `portfolio_backtest.log` | `backtest_buy_hold.run_backtest` | Full backtest log and performance summary |
 | `portfolio_nav.png` | `backtest_buy_hold.plot_nav` | Portfolio vs benchmark NAV |
 | `hs300etf_510300_*_performance.csv/.png` | `eval_hs300_perform.py` | Benchmark summary, daily NAV/drawdown, chart |
+| `group_return_analysis.csv` | `group_return_analysis.py` | Per-period AI/non-AI group returns, spread, inference and coverage |
+| `group_return_analysis.md` | `group_return_analysis.py` | Group-return summary table and caveats |
+| `group_return_spread.png` | `group_return_analysis.py` | Per-period spread bars and cumulative group growth |
 | `factor_contrib_detail.csv` | `barra_model_analysis.py` | Per-period factor and specific attribution |
 | `factor_contrib_barplot.png` | `barra_model_analysis.py` | Factor contribution bars |
 | `knowledge_base/output/*_events.md` | `news_collect.py` | Yearly event cards, policy ledger, valuation snapshots |
@@ -558,6 +591,7 @@ Existing logs, charts and canonical target files are backed up with `.bak-<times
 
 - **Point-in-time correctness** — no backward-filled benchmark values; valuation lookups are exact/as-of; constituents and weights come from the previous period-end file; the knowledge-base prompt forbids post-cutoff facts.
 - **Reproducibility** — content-addressed LLM caches, explicit prompt versions, atomic writes, deterministic backtests for unchanged inputs.
+- **Metric conventions** — return display uses geometric CAGR; Sharpe and IR use arithmetic mean excess returns; the legacy CAGR/vol Sharpe (`sharpe_cagr`) and geometric excess return (`geometric_excess_return` / `relative_cagr`) are retained for comparison but are not the IR numerator.
 - **Explicit failure** — missing prices, empty selections, invalid targets and failed K-line updates abort rather than silently degrading.
 - **Secret hygiene** — API keys and credentialed URLs are redacted from all surfaced errors; `.env` is used for configuration.
 
@@ -581,8 +615,12 @@ Existing logs, charts and canonical target files are backed up with `.bak-<times
 | AI compute chain | The upstream/midstream/downstream supply chain serving AI training and inference compute |
 | hfq / bfq | Back-adjusted / unadjusted price series |
 | Rebalance date | Semi-annual date at which the target portfolio is reselected and re-established |
-| Active return | Portfolio return minus benchmark return |
-| Tracking error | Annualized standard deviation of daily active returns |
-| Information ratio | Active return divided by tracking error |
+| CAGR | Compound annual growth rate; geometric annualized return |
+| Active return | Mean daily portfolio-minus-benchmark return (arithmetic), annualized by × 252 for the standard IR |
+| Tracking error | Annualized standard deviation of daily arithmetic active returns |
+| Information ratio | Standard arithmetic active return divided by tracking error |
+| Geometric excess return / relative CAGR | Full-period annualized relative return, `((P_end/P_start)/(B_end/B_start))^(1/years) − 1`; display only |
+| Sharpe ratio (standard) | Arithmetic annualized excess return divided by annualized volatility |
+| Sharpe ratio (legacy CAGR/vol) | Geometric annualized return divided by annualized volatility; retained as `sharpe_cagr` |
 | 0→1 theme | A theme transitioning from technological possibility to commercialization |
 | As-of / point-in-time | Using only information that was publicly available at the stated date |

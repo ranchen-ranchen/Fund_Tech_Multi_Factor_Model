@@ -860,6 +860,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="基准 CSV 路径；默认自动查找 hs300etf_510300_*_performance.csv 的最新文件",
     )
     parser.add_argument(
+        "--risk-free-rate", type=float, default=0.02,
+        help="年化无风险利率（小数），用于标准夏普；默认 0.02，与 eval_hs300_perform.py 一致",
+    )
+    parser.add_argument(
         "--weight-glob", default=WEIGHT_GLOB,
         help="沪深300权重 CSV 通配符；每个调仓日取上一期期末的持仓作为本期期初成分股",
     )
@@ -967,6 +971,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         plot_file=DEFAULT_PLOT_FILE,
         benchmark_file=benchmark_file,
         log_file=DEFAULT_LOG_FILE,
+        risk_free_rate=args.risk_free_rate,
     )
 
     # 5) 可选：发布为 canonical 目标文件（仅在回测确实产生结果后）

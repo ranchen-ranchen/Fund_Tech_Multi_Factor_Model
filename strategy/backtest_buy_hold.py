@@ -142,18 +142,69 @@ def load_benchmark_data(csv_path: str) -> pd.Series:
 
 
 # -----------------------------------------------------------------------------
+# 年化收益 / 夏普口径
+# -----------------------------------------------------------------------------
+def compute_sharpe_metrics(
+    daily_returns: pd.Series,
+    annual_return_cagr: float,
+    risk_free_rate: float = 0.02,
+    periods_per_year: int = 252,
+) -> Dict[str, float]:
+    """
+    计算年化波动与两种夏普口径。
+
+    - 标准夏普（headline，默认）：
+          (mean(日收益) × periods_per_year - risk_free_rate)
+          / (std(日收益) × sqrt(periods_per_year))
+      这是“算术年化超额收益 / 年化波动”口径；分母的标准差与分子的
+      算术均值同口径。
+    - CAGR/波动（legacy，仅用于与旧日志/旧报告对比）：
+          annual_return_cagr / 年化波动
+      不与标准差同口径，不再作为标准夏普。
+
+    返回:
+        annual_return_arithmetic: 算术年化收益
+        annual_vol:               年化波动
+        sharpe:                   标准夏普（含 risk_free_rate）
+        sharpe_cagr:              旧 CAGR/波动口径
+        sharpe_rf0:               标准夏普在 rf=0 下的值
+    """
+    r = daily_returns.dropna()
+    ann_vol = float(r.std() * np.sqrt(periods_per_year)) if len(r) > 1 else 0.0
+    ann_ret_arith = float(r.mean() * periods_per_year) if len(r) > 0 else 0.0
+
+    sharpe = (ann_ret_arith - risk_free_rate) / ann_vol if ann_vol > 0 else 0.0
+    sharpe_cagr = annual_return_cagr / ann_vol if ann_vol > 0 else 0.0
+    sharpe_rf0 = ann_ret_arith / ann_vol if ann_vol > 0 else 0.0
+
+    return {
+        "annual_return_arithmetic": ann_ret_arith,
+        "annual_vol":               ann_vol,
+        "sharpe":                   sharpe,
+        "sharpe_cagr":              sharpe_cagr,
+        "sharpe_rf0":               sharpe_rf0,
+    }
+
+
+# -----------------------------------------------------------------------------
 # 单只股票区间指标计算
 # -----------------------------------------------------------------------------
 def compute_stock_metrics(nav: pd.Series) -> Dict[str, float]:
     """
     给定一条从 1.0 开始的净值序列，计算常用绩效指标。
     年化收益与年化波动统一使用交易日（252）作为时间基准。
+
+    口径:
+        - annual_ret: 几何年化（CAGR）。
+        - sharpe: 标准算术夏普（默认 rf=0；本函数无 rf 参数）。
+        - sharpe_cagr: 旧的 CAGR/波动口径，个股明细表仍展示该值以便对比。
     """
     nav = nav.dropna()
     if len(nav) == 0:
         return {
             "final_nav": 1.0, "total_ret": 0.0, "annual_ret": 0.0,
-            "max_dd": 0.0, "ann_vol": 0.0, "sharpe": 0.0,
+            "annual_ret_arith": 0.0, "max_dd": 0.0, "ann_vol": 0.0,
+            "sharpe": 0.0, "sharpe_cagr": 0.0,
             "days": 0, "trading_days": 0,
         }
 
@@ -173,18 +224,19 @@ def compute_stock_metrics(nav: pd.Series) -> Dict[str, float]:
     max_dd = float(dd.min()) if len(dd) else 0.0
 
     daily_ret = nav.pct_change().dropna()
-    ann_vol = float(daily_ret.std() * np.sqrt(252)) if len(daily_ret) > 1 else 0.0
-    sharpe = annual_ret / ann_vol if ann_vol > 0 else 0.0
+    sh = compute_sharpe_metrics(daily_ret, annual_ret, risk_free_rate=0.0)
 
     return {
-        "final_nav":    final_nav,
-        "total_ret":    total_ret,
-        "annual_ret":   annual_ret,
-        "max_dd":       max_dd,
-        "ann_vol":      ann_vol,
-        "sharpe":       sharpe,
-        "days":         (nav.index[-1] - nav.index[0]).days,
-        "trading_days": trading_days,
+        "final_nav":        final_nav,
+        "total_ret":        total_ret,
+        "annual_ret":       annual_ret,
+        "annual_ret_arith": sh["annual_return_arithmetic"],
+        "max_dd":           max_dd,
+        "ann_vol":          sh["annual_vol"],
+        "sharpe":           sh["sharpe"],
+        "sharpe_cagr":      sh["sharpe_cagr"],
+        "days":             (nav.index[-1] - nav.index[0]).days,
+        "trading_days":     trading_days,
     }
 
 
@@ -195,16 +247,35 @@ def compute_information_ratio(
     portfolio_nav: pd.Series,
     benchmark_nav: pd.Series,
     periods_per_year: int = 252,
+    portfolio_initial_value: Optional[float] = None,
+    benchmark_initial_value: Optional[float] = None,
 ) -> Dict[str, float]:
     """
-    计算组合相对基准的主动管理指标：
+    计算组合相对基准的主动管理指标。
 
+    标准（算术）口径 —— 用于 IR：
         - 年化超额收益（Active Return）
               = mean(组合日收益 - 基准日收益) × periods_per_year
         - 年化跟踪误差（Tracking Error）
               = std(组合日收益 - 基准日收益) × sqrt(periods_per_year)
         - 信息比率（Information Ratio, IR）
               = 年化超额收益 / 年化跟踪误差
+
+    展示口径 —— 不参与 IR：
+        - portfolio_cagr / benchmark_cagr：重叠区间内按首尾净值计算的
+          几何年化收益。
+        - geometric_excess_return / relative_cagr：
+              ((P_end/P_start) / (B_end/B_start))^(1/years) - 1
+          即全区间年化相对收益。
+        - cagr_difference：portfolio_cagr - benchmark_cagr。
+      这些值用于和 headline CAGR 对照；IR 分子始终是上面的算术超额收益，
+      不是几何相对收益。
+
+    参数:
+        portfolio_initial_value / benchmark_initial_value:
+            几何口径的起算净值。默认取重叠区间的首日净值；回测主流程会
+            把组合的 normalized 初始资金 1.0 传入，使几何相对收益与
+            headline CAGR 使用同一基准。
 
     说明
     ----
@@ -213,14 +284,20 @@ def compute_information_ratio(
     也不会产生前视偏差。对齐区间由实际重叠数据决定。
     """
     empty = {
-        "active_return":     0.0,   # 年化超额收益
-        "tracking_error":    0.0,   # 年化跟踪误差
-        "information_ratio": 0.0,   # 信息比率
-        "excess_daily_mean": 0.0,   # 日均超额收益
-        "excess_daily_std":  0.0,   # 日超额收益标准差
-        "n_obs":             0,     # 有效样本数
-        "overlap_start":     None,  # 实际重叠起始日
-        "overlap_end":       None,  # 实际重叠结束日
+        "active_return":           0.0,   # 年化超额收益（算术，标准 IR 分子）
+        "tracking_error":          0.0,   # 年化跟踪误差
+        "information_ratio":       0.0,   # 信息比率（标准算术口径）
+        "excess_daily_mean":       0.0,   # 日均超额收益
+        "excess_daily_std":        0.0,   # 日超额收益标准差
+        "n_obs":                   0,     # 有效样本数
+        "overlap_start":           None,  # 实际重叠起始日
+        "overlap_end":             None,  # 实际重叠结束日
+        "portfolio_cagr":          0.0,   # 组合几何年化（展示）
+        "benchmark_cagr":          0.0,   # 基准几何年化（展示）
+        "cagr_difference":         0.0,   # 组合CAGR - 基准CAGR（展示）
+        "geometric_excess_return": 0.0,   # 几何相对CAGR（展示，不是 IR 分子）
+        "relative_cagr":           0.0,   # geometric_excess_return 的别名
+        "years":                   0.0,   # 几何口径使用的年数
     }
     if portfolio_nav is None or benchmark_nav is None:
         return empty
@@ -252,15 +329,48 @@ def compute_information_ratio(
     tracking_error = std_excess * np.sqrt(periods_per_year)
     ir = active_return / tracking_error if tracking_error > 0 else 0.0
 
+    # ---- 展示口径：几何年化收益 / 相对 CAGR（不参与 IR） ----
+    years = len(df) / periods_per_year if periods_per_year > 0 else 0.0
+    p_start = (
+        float(portfolio_initial_value)
+        if portfolio_initial_value is not None
+        else float(df["port"].iloc[0])
+    )
+    b_start = (
+        float(benchmark_initial_value)
+        if benchmark_initial_value is not None
+        else float(df["bench"].iloc[0])
+    )
+    p_end = float(df["port"].iloc[-1])
+    b_end = float(df["bench"].iloc[-1])
+
+    portfolio_cagr = 0.0
+    benchmark_cagr = 0.0
+    geometric_excess = 0.0
+    cagr_diff = 0.0
+    if years > 0 and p_start > 0 and p_end > 0 and b_start > 0 and b_end > 0:
+        portfolio_cagr = (p_end / p_start) ** (1 / years) - 1
+        benchmark_cagr = (b_end / b_start) ** (1 / years) - 1
+        geometric_excess = (
+            (p_end / p_start) / (b_end / b_start)
+        ) ** (1 / years) - 1
+        cagr_diff = portfolio_cagr - benchmark_cagr
+
     return {
-        "active_return":     active_return,
-        "tracking_error":    tracking_error,
-        "information_ratio": ir,
-        "excess_daily_mean": mean_excess,
-        "excess_daily_std":  std_excess,
-        "n_obs":             int(len(excess)),
-        "overlap_start":     df.index.min(),
-        "overlap_end":       df.index.max(),
+        "active_return":           active_return,
+        "tracking_error":          tracking_error,
+        "information_ratio":       ir,
+        "excess_daily_mean":       mean_excess,
+        "excess_daily_std":        std_excess,
+        "n_obs":                   int(len(excess)),
+        "overlap_start":           df.index.min(),
+        "overlap_end":             df.index.max(),
+        "portfolio_cagr":          portfolio_cagr,
+        "benchmark_cagr":          benchmark_cagr,
+        "cagr_difference":         cagr_diff,
+        "geometric_excess_return": geometric_excess,
+        "relative_cagr":           geometric_excess,
+        "years":                   years,
     }
 
 
@@ -363,6 +473,7 @@ def run_backtest(
     benchmark_file: Optional[str] = None,
     log_daily_stock_nav: bool = True,
     cost_rate: float = 0.005,
+    risk_free_rate: float = 0.02,
 ):
     """
     参数
@@ -384,11 +495,17 @@ def run_backtest(
                           每个时间段期初买入时：期初资金 × cost_rate 作为买入成本；
                           每个时间段期末卖出时：期末市值 × cost_rate 作为卖出成本。
                           两边合计即为双边交易成本。设为 0 可关闭成本。
+    risk_free_rate      : 年化无风险利率，默认 0.02（2%），与
+                          eval_hs300_perform.py 的默认值一致。标准夏普使用
+                          (算术年化收益 - risk_free_rate) / 年化波动；旧的
+                          CAGR/波动口径作为 sharpe_cagr 保留用于对比。
     """
     if cost_rate < 0:
         raise ValueError("cost_rate 不能为负数")
     if cost_rate >= 1:
         raise ValueError("cost_rate 必须小于 1")
+    if risk_free_rate >= 1:
+        raise ValueError("risk_free_rate 必须小于 1")
 
     logger = setup_logger(log_file)
 
@@ -400,6 +517,7 @@ def run_backtest(
     logger.info(f"日期对齐方式   : {align}")
     logger.info(f"单边交易成本   : {cost_rate*100:.4f}%  ({cost_rate*10000:.2f} bp)")
     logger.info(f"双边合计       : {cost_rate*2*100:.4f}%  (每期买入 + 期末卖出各一次)")
+    logger.info(f"无风险利率     : {risk_free_rate*100:.4f}%  (标准夏普分子使用)")
 
     if not periods:
         logger.error("未提供任何时间段配置")
@@ -614,7 +732,7 @@ def run_backtest(
                     f"{prices.index.max().date()}）")
         hdr = (f"  {'股票':<18s}{'权重':>9s}{'期末净值':>11s}{'区间收益':>11s}"
                f"{'年化收益':>11s}{'最大回撤':>11s}{'年化波动':>11s}"
-               f"{'夏普':>9s}{'收益贡献':>11s}")
+               f"{'夏普(CAGR)':>12s}{'收益贡献':>11s}")
         logger.info(hdr)
         logger.info("  " + "-" * (len(hdr) - 2))
 
@@ -634,7 +752,7 @@ def run_backtest(
                 f"{m['annual_ret']*100:>10.2f}%"
                 f"{m['max_dd']*100:>10.2f}%"
                 f"{m['ann_vol']*100:>10.2f}%"
-                f"{m['sharpe']:>9.4f}"
+                f"{m['sharpe_cagr']:>12.4f}"
                 f"{contrib*100:>10.2f}%"
             )
         logger.info("  " + "-" * (len(hdr) - 2))
@@ -668,6 +786,7 @@ def run_backtest(
                 "max_dd":       m["max_dd"],
                 "ann_vol":      m["ann_vol"],
                 "sharpe":       m["sharpe"],
+                "sharpe_cagr":  m["sharpe_cagr"],
                 "contrib":      weights[i] * m["total_ret"],
             })
 
@@ -740,7 +859,7 @@ def run_backtest(
         logger.info("=" * 78)
         hdr2 = (f"{'时间段':<18s}{'股票':<16s}{'权重':>8s}"
                 f"{'期末净值':>11s}{'区间收益':>11s}{'年化收益':>11s}"
-                f"{'最大回撤':>11s}{'年化波动':>11s}{'夏普':>9s}{'收益贡献':>11s}")
+                f"{'最大回撤':>11s}{'年化波动':>11s}{'夏普(CAGR)':>12s}{'收益贡献':>11s}")
         logger.info(hdr2)
         logger.info("-" * len(hdr2))
         for row in stock_overview_rows:
@@ -753,7 +872,7 @@ def run_backtest(
                 f"{row['annual_ret']*100:>10.2f}%"
                 f"{row['max_dd']*100:>10.2f}%"
                 f"{row['ann_vol']*100:>10.2f}%"
-                f"{row['sharpe']:>9.4f}"
+                f"{row['sharpe_cagr']:>12.4f}"
                 f"{row['contrib']*100:>10.2f}%"
             )
         logger.info("-" * len(hdr2))
@@ -777,17 +896,21 @@ def run_backtest(
     max_dd = float(dd.min())
 
     daily_ret = s.pct_change().dropna()
-    ann_vol   = float(daily_ret.std() * np.sqrt(252)) if len(daily_ret) > 1 else 0.0
-    sharpe    = ann_ret / ann_vol if ann_vol > 0 else 0.0
+    sh = compute_sharpe_metrics(daily_ret, ann_ret, risk_free_rate=risk_free_rate)
+    ann_vol       = sh["annual_vol"]
+    ann_ret_arith = sh["annual_return_arithmetic"]
+    sharpe        = sh["sharpe"]        # 标准：算术超额收益 / 波动
+    sharpe_cagr   = sh["sharpe_cagr"]   # 旧口径，仅对比
+    sharpe_rf0    = sh["sharpe_rf0"]
 
     header = (f"{'标的':<18s}{'期末净值':>11s}{'累计收益':>12s}"
-              f"{'年化收益':>12s}{'最大回撤':>12s}{'年化波动':>12s}{'夏普':>10s}")
+              f"{'年化收益':>12s}{'最大回撤':>12s}{'年化波动':>12s}{'夏普(算术)':>12s}")
     logger.info(header)
     logger.info("-" * 90)
     logger.info(
         f"{'TOTAL (net)':<18s}{final_nav:>11.4f}{total_ret*100:>11.2f}%"
         f"{ann_ret*100:>11.2f}%{max_dd*100:>11.2f}%"
-        f"{ann_vol*100:>11.2f}%{sharpe:>10.4f}"
+        f"{ann_vol*100:>11.2f}%{sharpe:>12.4f}"
     )
     logger.info("-" * 90)
 
@@ -797,6 +920,10 @@ def run_backtest(
     logger.info(f"累计交易成本   : {total_cost_accum:.6f}  (以初始资金为单位)")
     logger.info(f"费前累计收益   : {(final_nav + total_cost_accum) - 1.0:.4%}")
     logger.info(f"费后累计收益   : {total_ret:.4%}")
+    logger.info(f"年化收益(算术) : {ann_ret_arith*100:>10.2f}%  (CAGR {ann_ret*100:.2f}%)")
+    logger.info(f"夏普(算术, rf={risk_free_rate*100:.2f}%) : {sharpe:>10.4f}  (标准)")
+    logger.info(f"夏普(算术, rf=0%)    : {sharpe_rf0:>10.4f}")
+    logger.info(f"夏普(CAGR/波动, 旧口径) : {sharpe_cagr:>10.4f}  (仅对比)")
 
     # =========================================================================
     # 基准数据加载、对齐、统计，以及组合 vs 基准的主动管理指标
@@ -818,14 +945,20 @@ def run_backtest(
     # =========================================================================
     benchmark_aligned = None
     ir_metrics: Dict[str, float] = {
-        "active_return":     0.0,
-        "tracking_error":    0.0,
-        "information_ratio": 0.0,
-        "excess_daily_mean": 0.0,
-        "excess_daily_std":  0.0,
-        "n_obs":             0,
-        "overlap_start":     None,
-        "overlap_end":       None,
+        "active_return":           0.0,
+        "tracking_error":          0.0,
+        "information_ratio":       0.0,
+        "excess_daily_mean":       0.0,
+        "excess_daily_std":        0.0,
+        "n_obs":                   0,
+        "overlap_start":           None,
+        "overlap_end":             None,
+        "portfolio_cagr":          0.0,
+        "benchmark_cagr":          0.0,
+        "cagr_difference":         0.0,
+        "geometric_excess_return": 0.0,
+        "relative_cagr":           0.0,
+        "years":                   0.0,
     }
 
     if benchmark_file:
@@ -866,8 +999,14 @@ def run_backtest(
                     b_dd = (b - b_cummax) / b_cummax
                     b_max_dd = float(b_dd.min())
                     b_daily_ret = b.pct_change().dropna()
-                    b_ann_vol = float(b_daily_ret.std() * np.sqrt(252)) if len(b_daily_ret) > 1 else 0.0
-                    b_sharpe = b_ann_ret / b_ann_vol if b_ann_vol > 0 else 0.0
+                    b_sh = compute_sharpe_metrics(
+                        b_daily_ret, b_ann_ret, risk_free_rate=risk_free_rate
+                    )
+                    b_ann_vol       = b_sh["annual_vol"]
+                    b_ann_ret_arith = b_sh["annual_return_arithmetic"]
+                    b_sharpe        = b_sh["sharpe"]        # 标准
+                    b_sharpe_cagr   = b_sh["sharpe_cagr"]   # 旧口径
+                    b_sharpe_rf0    = b_sh["sharpe_rf0"]
 
                     logger.info("")
                     logger.info("=" * 78)
@@ -880,19 +1019,36 @@ def run_backtest(
                     logger.info(
                         f"{'BENCHMARK':<18s}{b_final:>11.4f}{b_total_ret*100:>11.2f}%"
                         f"{b_ann_ret*100:>11.2f}%{b_max_dd*100:>11.2f}%"
-                        f"{b_ann_vol*100:>11.2f}%{b_sharpe:>10.4f}"
+                        f"{b_ann_vol*100:>11.2f}%{b_sharpe:>12.4f}"
                     )
                     logger.info("-" * 90)
+                    logger.info(
+                        f"基准年化收益(算术) : {b_ann_ret_arith*100:>10.2f}%  "
+                        f"(CAGR {b_ann_ret*100:.2f}%)"
+                    )
+                    logger.info(
+                        f"基准夏普(算术, rf={risk_free_rate*100:.2f}%) : "
+                        f"{b_sharpe:>10.4f}  (标准)"
+                    )
+                    logger.info(f"基准夏普(算术, rf=0%)    : {b_sharpe_rf0:>10.4f}")
+                    logger.info(
+                        f"基准夏普(CAGR/波动, 旧口径) : {b_sharpe_cagr:>10.4f}  (仅对比)"
+                    )
 
                     # =====================================================
                     # 组合 vs 基准 · 主动管理指标（信息比率等）
                     # 组合净值已扣双边交易成本
                     # =====================================================
-                    ir_metrics = compute_information_ratio(s, b, periods_per_year=252)
+                    overlap_starts_together = s.index.min() == b.index.min()
+                    ir_metrics = compute_information_ratio(
+                        s, b, periods_per_year=252,
+                        portfolio_initial_value=1.0 if overlap_starts_together else None,
+                        benchmark_initial_value=float(b.iloc[0]),
+                    )
 
                     logger.info("")
                     logger.info("=" * 78)
-                    logger.info("组合(费后) vs 基准 · 主动管理指标（Information Ratio）")
+                    logger.info("组合(费后) vs 基准 · 主动管理指标（标准算术 IR）")
                     logger.info("=" * 78)
                     if ir_metrics["overlap_start"] is not None:
                         logger.info(
@@ -903,9 +1059,22 @@ def run_backtest(
                     logger.info(f"有效样本交易日         : {ir_metrics['n_obs']}")
                     logger.info(f"日均超额收益           : {ir_metrics['excess_daily_mean']*100:>10.4f}%")
                     logger.info(f"日超额收益标准差       : {ir_metrics['excess_daily_std']*100:>10.4f}%")
-                    logger.info(f"年化超额收益(Active)   : {ir_metrics['active_return']*100:>10.2f}%")
+                    logger.info(f"年化超额收益(Active, 算术) : {ir_metrics['active_return']*100:>10.2f}%")
                     logger.info(f"年化跟踪误差(TE)       : {ir_metrics['tracking_error']*100:>10.2f}%")
-                    logger.info(f"信息比率 (IR)          : {ir_metrics['information_ratio']:>10.4f}")
+                    logger.info(f"信息比率 (IR, 标准算术) : {ir_metrics['information_ratio']:>10.4f}")
+                    logger.info(
+                        f"几何超额收益(相对CAGR) : "
+                        f"{ir_metrics['geometric_excess_return']*100:>10.2f}%  (仅展示)"
+                    )
+                    logger.info(
+                        f"组合CAGR / 基准CAGR     : "
+                        f"{ir_metrics['portfolio_cagr']*100:>10.2f}% / "
+                        f"{ir_metrics['benchmark_cagr']*100:>10.2f}%"
+                    )
+                    logger.info(
+                        f"CAGR差(组合-基准)       : "
+                        f"{ir_metrics['cagr_difference']*100:>10.2f}pp  (仅展示)"
+                    )
 
                     # 直观解读
                     ir_val = ir_metrics["information_ratio"]
@@ -945,18 +1114,27 @@ def run_backtest(
     logger.info("=" * 78)
 
     summary = [{
-        "name":              "TOTAL",
-        "final_nav":         final_nav,
-        "total_return":      total_ret,
-        "annual_return":     ann_ret,
-        "max_drawdown":      max_dd,
-        "annual_vol":        ann_vol,
-        "sharpe":            sharpe,
-        "active_return":     ir_metrics["active_return"],
-        "tracking_error":    ir_metrics["tracking_error"],
-        "information_ratio": ir_metrics["information_ratio"],
-        "total_cost":        total_cost_accum,
-        "cost_rate":         cost_rate,
+        "name":                     "TOTAL",
+        "final_nav":                final_nav,
+        "total_return":             total_ret,
+        "annual_return":            ann_ret,              # 几何 CAGR
+        "annual_return_arithmetic": ann_ret_arith,        # 算术年化
+        "max_drawdown":             max_dd,
+        "annual_vol":               ann_vol,
+        "sharpe":                   sharpe,               # 标准：算术超额 / 波动
+        "sharpe_cagr":              sharpe_cagr,          # 旧 CAGR/波动口径
+        "sharpe_rf0":               sharpe_rf0,           # 标准夏普，rf=0
+        "risk_free_rate":           risk_free_rate,
+        "active_return":            ir_metrics["active_return"],
+        "tracking_error":           ir_metrics["tracking_error"],
+        "information_ratio":        ir_metrics["information_ratio"],
+        "geometric_excess_return":  ir_metrics["geometric_excess_return"],
+        "relative_cagr":            ir_metrics["relative_cagr"],
+        "cagr_difference":          ir_metrics["cagr_difference"],
+        "portfolio_cagr":           ir_metrics["portfolio_cagr"],
+        "benchmark_cagr":           ir_metrics["benchmark_cagr"],
+        "total_cost":               total_cost_accum,
+        "cost_rate":                cost_rate,
     }]
 
     return nav, summary
